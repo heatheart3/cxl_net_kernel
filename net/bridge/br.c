@@ -17,6 +17,11 @@
 #include <net/stp.h>
 #include <net/switchdev.h>
 #include <linux/io.h>
+#include <linux/mm.h>
+#include <linux/slab.h>
+#include <linux/numa.h>
+#include <linux/sched.h>
+#include <linux/topology.h>
 
 #include "br_private.h"
 
@@ -412,6 +417,95 @@ void cxl_mem_deinit(void)
     }
     pr_info("[br_cxl_deinit] unmapped and exit\n");
 }
+static struct kmem_cache *cxl_test_cache;
+static void test_cxl_slab_alloc(int node_id, size_t size)
+{
+    void *obj;
+    struct page *pg;
+    phys_addr_t phys;
+
+    printk(KERN_INFO "[CXL-SLAB-TEST] Creating kmem_cache(size=%zu)\n", size);
+
+    cxl_test_cache = kmem_cache_create("cxl_slab_test_cache",
+                                       size,
+                                       0,
+                                       SLAB_HWCACHE_ALIGN,
+                                       NULL);
+    if (!cxl_test_cache) {
+        printk(KERN_ERR "[CXL-SLAB-TEST] kmem_cache_create failed.\n");
+        return;
+    }
+    printk(KERN_INFO "[CXL-SLAB-TEST] Allocating from node %d ...\n", node_id);
+
+    obj = kmem_cache_alloc_node(cxl_test_cache, GFP_HIGHUSER_MOVABLE, node_id);
+    if (!obj) {
+        printk(KERN_ERR "[CXL-SLAB-TEST] kmem_cache_alloc_node FAILED on node %d\n",
+               node_id);
+        goto out;
+    }
+
+    pg = virt_to_page(obj);
+    phys = page_to_phys(pg);
+
+    printk(KERN_INFO "[CXL-SLAB-TEST] Allocation succeeded!\n");
+    printk(KERN_INFO "[CXL-SLAB-TEST] Virtual addr: %px\n", obj);
+    printk(KERN_INFO "[CXL-SLAB-TEST] Page frame number: %lu\n", page_to_pfn(pg));
+    printk(KERN_INFO "[CXL-SLAB-TEST] Physical addr: 0x%llx\n", (unsigned long long) phys);
+    printk(KERN_INFO "[CXL-SLAB-TEST] Allocated on NUMA node: %d\n", page_to_nid(pg));
+
+    if (page_to_nid(pg) == node_id)
+        printk(KERN_INFO "[CXL-SLAB-TEST] SUCCESS: Slab allocated on CXL node %d!\n", node_id);
+    else
+        printk(KERN_WARNING "[CXL-SLAB-TEST] WARNING: Slab NOT allocated on requested node %d.\n",
+                            node_id);
+
+out:
+    if (cxl_test_cache) {
+        kmem_cache_destroy(cxl_test_cache);
+        cxl_test_cache = NULL;
+    }
+}
+
+
+void show_zonelist(void)
+{
+	int nid;
+
+    for (nid = 0; nid < nr_node_ids; nid++) {
+        struct zonelist *zl;
+        struct zoneref *zref;
+        int gfp_idx = gfp_zonelist(GFP_KERNEL);
+
+        pr_info("=== NUMA Node %d ===\n", nid);
+        zl = NODE_DATA(nid)->node_zonelists + gfp_idx;
+
+        for (zref = zl->_zonerefs; zref->zone; zref++) {
+            struct zone *z = zref->zone;
+            pr_info("  zonelist entry: node %d zone %s\n",
+                    zone_to_nid(z),
+                    z->name);
+        }
+    }
+
+}
+void test_alloc_from_cxl(void)
+{
+	int nid = 1; // 你的 CXL node
+    struct page *page;
+
+    // 试一个“可移动”的分配
+    page = alloc_pages_node(nid, GFP_HIGHUSER_MOVABLE, 0);
+    if (!page) {
+        pr_info("alloc_pages_node(%d, GFP_HIGHUSER_MOVABLE) failed\n", nid);
+    }
+	phys_addr_t phys = (phys_addr_t)page_to_pfn(page) << PAGE_SHIFT;
+	pr_info("CXL frag: page=%p, page_phys=0x%llx\n",page,(unsigned long long)phys);
+    pr_info("GFP_HIGHUSER_MOVABLE: got page on nid=%d\n", page_to_nid(page));
+
+    __free_pages(page, 0);
+}
+
+
 
 static int __init br_init(void)
 {
@@ -425,8 +519,11 @@ static int __init br_init(void)
 		return err;
 	}
 
-	cxl_mem_init();
-	
+	// cxl_mem_init();
+	// show_zonelist();
+	// test_alloc_from_cxl();
+
+	test_cxl_slab_alloc(1, 256);
 
 	err = br_fdb_init();
 	if (err)

@@ -268,13 +268,7 @@ struct page *alloc_pages_mpol(gfp_t gfp, unsigned int order,
 struct folio *folio_alloc(gfp_t gfp, unsigned int order);
 struct folio *vma_alloc_folio(gfp_t gfp, int order, struct vm_area_struct *vma,
 		unsigned long addr, bool hugepage);
-#else
-static inline struct page *alloc_pages(gfp_t gfp_mask, unsigned int order)
-{
-	return alloc_pages_node(numa_node_id(), gfp_mask, order);
-}
-
-// static inline struct page* cxl_alloc_pages(gfp_t gfp_mask, unsigned int order)
+struct page* cxl_alloc_pages(gfp_t gfp_mask, unsigned int order);
 // {
 // 	u8 cxl_node_id = 1;
 // 	if (cxl_node_id >= 0 && cxl_node_id < nr_node_ids &&
@@ -288,6 +282,13 @@ static inline struct page *alloc_pages(gfp_t gfp_mask, unsigned int order)
 // 		return alloc_pages_node(numa_node_id(), gfp_mask, order);	
 // 	}
 // }
+#else
+static inline struct page *alloc_pages(gfp_t gfp_mask, unsigned int order)
+{
+	return alloc_pages_node(numa_node_id(), gfp_mask, order);
+}
+
+
 static inline struct page *alloc_pages_mpol(gfp_t gfp, unsigned int order,
 		struct mempolicy *mpol, pgoff_t ilx, int nid)
 {

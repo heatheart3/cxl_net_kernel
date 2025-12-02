@@ -2206,6 +2206,28 @@ struct page *alloc_pages(gfp_t gfp, unsigned int order)
 }
 EXPORT_SYMBOL(alloc_pages);
 
+struct page* cxl_alloc_pages(gfp_t gfp_mask, unsigned int order)
+{
+	// pr_info("CXL numanode page alloc\n");
+
+	u8 cxl_node_id = 1;
+	if (cxl_node_id >= 0 
+		&& cxl_node_id < nr_node_ids &&
+        node_online(cxl_node_id)) 
+		{
+        /* CXL node 存在并 online：从 CXL 节点分配页 */
+		// pr_info("Alloc page from CXL numanode\n"); 
+        return alloc_pages_node(1, GFP_HIGHUSER_MOVABLE, order);
+    }
+	else
+	{
+		pr_info("CXL numanode isn't online. Fallback to current cpu's numanode\n");
+		return alloc_pages_node(numa_node_id(),gfp_mask, order);	
+	}
+}
+EXPORT_SYMBOL(cxl_alloc_pages);
+
+
 struct folio *folio_alloc(gfp_t gfp, unsigned int order)
 {
 	return page_rmappable_folio(alloc_pages(gfp | __GFP_COMP, order));
@@ -3067,3 +3089,5 @@ void mpol_to_str(char *buffer, int maxlen, struct mempolicy *pol)
 		p += scnprintf(p, buffer + maxlen - p, ":%*pbl",
 			       nodemask_pr_args(&nodes));
 }
+
+

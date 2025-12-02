@@ -4907,6 +4907,10 @@ static int init_kmem_cache_nodes(struct kmem_cache *s)
 {
 	int node;
 
+	if (node_online(1))
+	{
+		pr_info("SLUB slab_nodes = %*pb\n", MAX_NUMNODES,slab_nodes.bits);
+	}
 	for_each_node_mask(node, slab_nodes) {
 		struct kmem_cache_node *n;
 

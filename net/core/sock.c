@@ -2892,7 +2892,20 @@ DEFINE_STATIC_KEY_FALSE(net_high_order_alloc_disable_key);
  */
 bool skb_page_frag_refill(unsigned int sz, struct page_frag *pfrag, gfp_t gfp)
 {
+
+	if (pfrag->page){
+		if(!page_to_nid(pfrag->page))
+		{
+			pfrag->page = cxl_alloc_pages(gfp, 0);
+			if (likely(pfrag->page)) {
+				pfrag->size = PAGE_SIZE;
+				return true;
+			}
+		}
+	}
+	
 	if (pfrag->page) {
+
 		if (page_ref_count(pfrag->page) == 1) {
 			pfrag->offset = 0;
 			return true;
@@ -2903,20 +2916,22 @@ bool skb_page_frag_refill(unsigned int sz, struct page_frag *pfrag, gfp_t gfp)
 	}
 
 	pfrag->offset = 0;
-	if (SKB_FRAG_PAGE_ORDER &&
-	    !static_branch_unlikely(&net_high_order_alloc_disable_key)) {
-		/* Avoid direct reclaim but allow kswapd to wake */
-		pfrag->page = alloc_pages((gfp & ~__GFP_DIRECT_RECLAIM) |
-					  __GFP_COMP | __GFP_NOWARN |
-					  __GFP_NORETRY,
-					  SKB_FRAG_PAGE_ORDER);
-		if (likely(pfrag->page)) {
-			pfrag->size = PAGE_SIZE << SKB_FRAG_PAGE_ORDER;
-			return true;
-		}
-	}
-	pfrag->page = alloc_page(gfp);
-	// pfrag->page = cxl_alloc_pages(gfp, 0);
+	/*** Temporally banned big pages in CXL test ***/
+	// if (SKB_FRAG_PAGE_ORDER &&
+	//     !static_branch_unlikely(&net_high_order_alloc_disable_key)) {
+	// 	/* Avoid direct reclaim but allow kswapd to wake */
+	// 	pfrag->page = alloc_pages((gfp & ~__GFP_DIRECT_RECLAIM) |
+	// 				  __GFP_COMP | __GFP_NOWARN |
+	// 				  __GFP_NORETRY,
+	// 				  SKB_FRAG_PAGE_ORDER);
+	// 	if (likely(pfrag->page)) {
+	// 		pfrag->size = PAGE_SIZE << SKB_FRAG_PAGE_ORDER;
+	// 		return true;
+	// 	}
+	// }
+	
+	// pfrag->page = alloc_page(gfp);
+	pfrag->page = cxl_alloc_pages(gfp, 0);
 	if (likely(pfrag->page)) {
 		pfrag->size = PAGE_SIZE;
 		return true;
@@ -2927,7 +2942,10 @@ EXPORT_SYMBOL(skb_page_frag_refill);
 
 bool sk_page_frag_refill(struct sock *sk, struct page_frag *pfrag)
 {
+	//original (without CXL)
+	// if (likely(skb_page_frag_refill(32U, pfrag, sk->sk_allocation)))
 	if (likely(skb_page_frag_refill(32U, pfrag, sk->sk_allocation)))
+
 		return true;
 
 	sk_enter_memory_pressure(sk);

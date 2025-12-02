@@ -1636,7 +1636,14 @@ static __always_inline struct zoneref *next_zones_zonelist(struct zoneref *z,
 					nodemask_t *nodes)
 {
 	if (likely(!nodes && zonelist_zone_idx(z) <= highest_zoneidx))
+	{
+		// if(zone_to_nid(z->zone))
+		// {
+		// 	pr_info("[next_zones_zonelist] get zone from cxl node\n");
+		// }
 		return z;
+
+	}
 	return __next_zones_zonelist(z, highest_zoneidx, nodes);
 }
 

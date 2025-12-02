@@ -18,6 +18,9 @@
 #include <linux/ip.h>
 #include <linux/inet.h>
 #include "br_private.h"
+#include <linux/mm.h>
+#include <linux/memcontrol.h>
+
 
 /* Don't forward packets to originating port or forwarding disabled */
 static inline int should_deliver(const struct net_bridge_port *p,
@@ -101,22 +104,22 @@ void dump_skb_frags(struct sk_buff *skb)
 {
     struct skb_shared_info *shinfo = skb_shinfo(skb);
     int i;
-
-    pr_info("nr_frags = %u\n", shinfo->nr_frags);
+	
+    // pr_info("nr_frags = %u\n", shinfo->nr_frags);
 
     for (i = 0; i < shinfo->nr_frags; i++) {
         skb_frag_t *f = &shinfo->frags[i];
         struct page *page = skb_frag_page(f);
-
+		int nid = page_to_nid(page);
         phys_addr_t phys = (phys_addr_t)page_to_pfn(page) << PAGE_SHIFT;
 
         pr_info("frag[%d]: page=%p, page_phys=0x%llx, "
-                "page_offset=%u, size=%u\n",
+                "page_offset=%u, size=%u, numanode_id=%d\n",
                 i,
                 page,
                 (unsigned long long)phys,
                 skb_frag_off(f),
-                skb_frag_size(f));
+                skb_frag_size(f), nid);
     }
 }
 

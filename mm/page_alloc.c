@@ -3309,7 +3309,6 @@ try_this_zone:
 				gfp_mask, alloc_flags, ac->migratetype);
 		if (page) {
 			prep_new_page(page, order, gfp_mask, alloc_flags);
-
 			/*
 			 * If this is a high-order atomic allocation then check
 			 * if the pageblock should be reserved for the future
@@ -4354,7 +4353,10 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 	 */
 	ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
 					ac->highest_zoneidx, ac->nodemask);
-
+	// if(preferred_nid == 1)
+	// {
+	// 	pr_info("[prepare_alloc_pages] current zone numanode id:%d\n", zone_to_nid(ac->preferred_zoneref->zone));
+	// }
 	return true;
 }
 
@@ -4558,7 +4560,10 @@ struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
 	if (!prepare_alloc_pages(gfp, order, preferred_nid, nodemask, &ac,
 			&alloc_gfp, &alloc_flags))
 		return NULL;
-
+	// if(preferred_nid == 1) {
+	// 	pr_info("[__alloc_pages]: current preferred_nid: %d, zone_node_id:%d\n", preferred_nid, zone_to_nid(ac.preferred_zoneref->zone));
+	// }
+	
 	/*
 	 * Forbid the first pass from falling back to types that fragment
 	 * memory until all local zones are considered.
@@ -4567,6 +4572,7 @@ struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
 
 	/* First allocation attempt */
 	page = get_page_from_freelist(alloc_gfp, order, alloc_flags, &ac);
+
 	if (likely(page))
 		goto out;
 
@@ -4578,7 +4584,6 @@ struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
 	 * &cpuset_current_mems_allowed to optimize the fast-path attempt.
 	 */
 	ac.nodemask = nodemask;
-
 	page = __alloc_pages_slowpath(alloc_gfp, order, &ac);
 
 out:
