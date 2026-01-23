@@ -2217,7 +2217,7 @@ struct page* cxl_alloc_pages(gfp_t gfp_mask, unsigned int order)
 		{
         /* CXL node 存在并 online：从 CXL 节点分配页 */
 		// pr_info("Alloc page from CXL numanode\n"); 
-        return alloc_pages_node(1, GFP_HIGHUSER_MOVABLE, order);
+        return alloc_pages_node(1, gfp_mask, order);
     }
 	else
 	{

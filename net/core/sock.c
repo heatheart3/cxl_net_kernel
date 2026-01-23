@@ -2894,11 +2894,19 @@ bool skb_page_frag_refill(unsigned int sz, struct page_frag *pfrag, gfp_t gfp)
 {
 
 	if (pfrag->page){
-		if(!page_to_nid(pfrag->page))
-		{
-			pfrag->page = cxl_alloc_pages(gfp, 0);
+		if(!page_to_nid(pfrag->page) && node_online(1))
+		{	/**** common size allocation ****/ 
+			// pfrag->page = cxl_alloc_pages(gfp, 0);
+			// if (likely(pfrag->page)) {
+			// 	pfrag->size = PAGE_SIZE;
+			// 	return true;
+			// }
+			pfrag->page = cxl_alloc_pages((gfp & ~__GFP_DIRECT_RECLAIM) |
+					  __GFP_COMP | __GFP_NOWARN |
+					  __GFP_NORETRY,
+					  SKB_FRAG_PAGE_ORDER);
 			if (likely(pfrag->page)) {
-				pfrag->size = PAGE_SIZE;
+				pfrag->size = PAGE_SIZE << SKB_FRAG_PAGE_ORDER;
 				return true;
 			}
 		}
@@ -2917,18 +2925,23 @@ bool skb_page_frag_refill(unsigned int sz, struct page_frag *pfrag, gfp_t gfp)
 
 	pfrag->offset = 0;
 	/*** Temporally banned big pages in CXL test ***/
-	// if (SKB_FRAG_PAGE_ORDER &&
-	//     !static_branch_unlikely(&net_high_order_alloc_disable_key)) {
-	// 	/* Avoid direct reclaim but allow kswapd to wake */
-	// 	pfrag->page = alloc_pages((gfp & ~__GFP_DIRECT_RECLAIM) |
-	// 				  __GFP_COMP | __GFP_NOWARN |
-	// 				  __GFP_NORETRY,
-	// 				  SKB_FRAG_PAGE_ORDER);
-	// 	if (likely(pfrag->page)) {
-	// 		pfrag->size = PAGE_SIZE << SKB_FRAG_PAGE_ORDER;
-	// 		return true;
-	// 	}
-	// }
+	if (SKB_FRAG_PAGE_ORDER &&
+	    !static_branch_unlikely(&net_high_order_alloc_disable_key)) {
+		/* Avoid direct reclaim but allow kswapd to wake */
+		// pfrag->page = alloc_pages((gfp & ~__GFP_DIRECT_RECLAIM) |
+		// 			  __GFP_COMP | __GFP_NOWARN |
+		// 			  __GFP_NORETRY,
+		// 			  SKB_FRAG_PAGE_ORDER);
+		pfrag->page = cxl_alloc_pages((gfp & ~__GFP_DIRECT_RECLAIM) |
+					  __GFP_COMP | __GFP_NOWARN |
+					  __GFP_NORETRY,
+					  SKB_FRAG_PAGE_ORDER);
+
+		if (likely(pfrag->page)) {
+			pfrag->size = PAGE_SIZE << SKB_FRAG_PAGE_ORDER;
+			return true;
+		}
+	}
 	
 	// pfrag->page = alloc_page(gfp);
 	pfrag->page = cxl_alloc_pages(gfp, 0);

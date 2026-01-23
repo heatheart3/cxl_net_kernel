@@ -648,7 +648,17 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 	 * aligned memory blocks, unless SLUB/SLAB debug is enabled.
 	 * Both skb->head and skb_shared_info are cache line aligned.
 	 */
-	data = kmalloc_reserve(&size, gfp_mask, node, &pfmemalloc);
+	// change to page backed head
+	if(node_online(1))
+		data = kmalloc_reserve(&size, gfp_mask, 1, &pfmemalloc);
+	else
+		data = kmalloc_reserve(&size, gfp_mask, node, &pfmemalloc);
+	// struct page* p = alloc_page(GFP_KERNEL);
+	// if (unlikely(!p))
+    //     return -ENOMEM;
+
+    // data = page_address(p);
+
 	if (unlikely(!data))
 		goto nodata;
 	/* kmalloc_size_roundup() might give us more room than requested.
@@ -665,7 +675,7 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 	memset(skb, 0, offsetof(struct sk_buff, tail));
 	__build_skb_around(skb, data, size);
 	skb->pfmemalloc = pfmemalloc;
-
+	// skb->head_frag = 1;
 	if (flags & SKB_ALLOC_FCLONE) {
 		struct sk_buff_fclones *fclones;
 
@@ -683,6 +693,20 @@ nodata:
 }
 EXPORT_SYMBOL(__alloc_skb);
 
+struct sk_buff* cxl_skb_fclone_alloc(unsigned int size,
+					       gfp_t priority)
+{
+	if(node_online(1))
+	{
+		return __alloc_skb(size, priority, SKB_ALLOC_FCLONE, 1);
+	}
+	else
+	{
+		return __alloc_skb(size, priority, SKB_ALLOC_FCLONE, NUMA_NO_NODE);
+	}
+
+}
+EXPORT_SYMBOL(cxl_skb_fclone_alloc);
 /**
  *	__netdev_alloc_skb - allocate an skbuff for rx on a specific device
  *	@dev: network device to receive on

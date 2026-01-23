@@ -1298,6 +1298,11 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	prior_wstamp = tp->tcp_wstamp_ns;
 	tp->tcp_wstamp_ns = max(tp->tcp_wstamp_ns, tp->tcp_clock_cache);
 	skb_set_delivery_time(skb, tp->tcp_wstamp_ns, true);
+
+	// struct skb_shared_info *shinfo = skb_shinfo(skb);
+	// skb_frag_t *f = &shinfo->frags[0];
+	// pr_info("[__transmit_skb]: nonlinear area size: %d\n",skb_frag_size(f));
+
 	if (clone_it) {
 		oskb = skb;
 
@@ -2722,6 +2727,10 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 	}
 
 	max_segs = tcp_tso_segs(sk, mss_now);
+	// max_segs = 4;
+	// struct sk_buff* skb1 = tcp_send_head(sk);
+	// pr_info("[tcp_write_xmit] number of segs: %d mss_now:%d, gso_size:%d\n", max_segs, mss_now, skb_shinfo(skb1)->gso_size);
+	// pr_info("[tcp_write_xmit] pacing rate:%d pacing shift:%d\n", sk->sk_pacing_rate, sk->sk_pacing_shift);
 	while ((skb = tcp_send_head(sk))) {
 		unsigned int limit;
 

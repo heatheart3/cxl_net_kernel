@@ -62,6 +62,7 @@
 #include <trace/events/skb.h>
 #include <net/busy_poll.h>
 #include <crypto/hash.h>
+#include <linux/printk.h>
 
 /*
  *	Is a socket 'connection oriented' ?
@@ -430,12 +431,18 @@ static int __skb_datagram_iter(const struct sk_buff *skb, int offset,
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 		int end;
 		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
-
 		WARN_ON(start > offset + len);
-
+		// {
+		// 	// 获取该页的物理地址
+		// 	phys_addr_t phys = page_to_phys(skb_frag_page(frag));
+		// 	// %pa 是内核打印物理地址的标准格式，需要传入地址的指针
+		// 	pr_info("RECV_DEBUG: frag[%d] page_ptr=%p, phys_addr=%pa, size=%u, offset=%u\n", 
+		// 			i, skb_frag_page(frag), &phys, skb_frag_size(frag), skb_frag_off(frag));
+		// }
 		end = start + skb_frag_size(frag);
 		if ((copy = end - offset) > 0) {
 			struct page *page = skb_frag_page(frag);
+		
 			u8 *vaddr = kmap(page);
 
 			if (copy > len)

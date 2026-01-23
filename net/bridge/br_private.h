@@ -54,10 +54,37 @@ enum {
 #define BR_STP_PROG	"/sbin/bridge-stp"
 
 #define BR_FDB_NOTIFY_SETTABLE_BITS (FDB_NOTIFY_BIT | FDB_NOTIFY_INACTIVE_BIT)
+#define SENDER_FEATURE 1
+#define RECV_FEATURE 0
+#define RING_SIZE 1024
 
 typedef struct bridge_id bridge_id;
 typedef struct mac_addr mac_addr;
 typedef __u16 port_id;
+
+struct skb_location_enrty{
+	u64 offset;
+	u32 size;
+	u64 pfn;
+	char blank[12];
+};
+
+struct cxl_skb_entry{
+	struct skb_location_enrty header;
+	struct skb_location_enrty payload;
+};
+
+struct cxl_skb_ring {
+	u32 ring_size;  /* 2^n */
+	u32 head;       /* producer only writes, consumer only reads */
+	u32 tail;       /* consumer only writes, producer only reads */
+	u8 init_mark;
+	char blank[51];
+	struct cxl_skb_entry buf[RING_SIZE];
+};
+
+
+
 
 struct bridge_id {
 	unsigned char	prio[2];
@@ -442,6 +469,7 @@ struct net_bridge_port {
 
 	struct bridge_stp_xstats	stp_xstats;
 };
+
 
 #define kobj_to_brport(obj)	container_of(obj, struct net_bridge_port, kobj)
 

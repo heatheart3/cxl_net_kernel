@@ -868,8 +868,9 @@ struct sk_buff *tcp_stream_alloc_skb(struct sock *sk, gfp_t gfp,
 				     bool force_schedule)
 {
 	struct sk_buff *skb;
-
+	
 	skb = alloc_skb_fclone(MAX_TCP_HEADER, gfp);
+	// pr_info("[tcp_stream_alloc_skb] header size:%d", MAX_TCP_HEADER);
 	if (likely(skb)) {
 		bool mem_scheduled;
 
@@ -1130,7 +1131,6 @@ restart:
 	err = -EPIPE;
 	if (sk->sk_err || (sk->sk_shutdown & SEND_SHUTDOWN))
 		goto do_error;
-
 	while (msg_data_left(msg)) {
 		ssize_t copy = 0;
 
@@ -1201,7 +1201,6 @@ new_segment:
 			copy = tcp_wmem_schedule(sk, copy);
 			if (!copy)
 				goto wait_for_space;
-
 			err = skb_copy_to_page_nocache(sk, &msg->msg_iter, skb,
 						       pfrag->page,
 						       pfrag->offset,

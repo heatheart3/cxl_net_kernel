@@ -388,123 +388,63 @@ static const struct stp_proto br_stp_proto = {
 	.rcv	= br_stp_rcv,
 };
 
-void* vaddr_cxl;
-u64 used_size;
+void* cxl_offset_mem_addr;
+void* cxl_numa_mem_addr;
 
-void cxl_mem_init(void)
+void cxl_numa_mem_init(void)
 {
 	phys_addr_t phys_base = (phys_addr_t)0xb90000000;
-	u64 mapped_size = 2ULL * 1024 * 1024;
-	vaddr_cxl = memremap(phys_base, mapped_size, MEMREMAP_WB);
-    if (!vaddr_cxl) {
+	u64 mapped_size = 4ULL * 1024 * 1024 * 1024;
+	// void* vaddr_cxl = memremap(phys_base, mapped_size, MEMREMAP_WB);
+	cxl_numa_mem_addr = memremap(phys_base, mapped_size, MEMREMAP_WB);
+    if (!cxl_numa_mem_addr) {
+        pr_err("[br_cxl_init] numa memremap failed\n");
+    }
+}
+
+void cxl_numa_mem_deinit(void){
+	memunmap(cxl_numa_mem_addr);
+	pr_info("[br_cxl_deinit] numa part unmapped and exit\n");
+
+}
+void cxl_offset_mem_deinit(void){
+	memunmap(cxl_offset_mem_addr);
+	pr_info("[br_cxl_deinit] offset part unmapped and exit\n");
+
+}
+
+void cxl_offset_mem_init(void)
+{	
+	phys_addr_t phys_base = (phys_addr_t)0xc90000000;
+	u64 mapped_size = 4ULL * 1024 * 1024 * 1024;
+	// void* vaddr_cxl = memremap(phys_base, mapped_size, MEMREMAP_WB);
+	cxl_offset_mem_addr = memremap(phys_base, mapped_size, MEMREMAP_WB);
+    if (!cxl_offset_mem_addr) {
         pr_err("[br_cxl_init] memremap failed\n");
-        return;
     }
-
-	pr_info("[br_cxl_init] mapped   : va_base=%p  ~  va_end=%p\n",
-                vaddr_cxl, (void *)((char *)vaddr_cxl + mapped_size - 1));
-	u32 user_va, rb;
-	*(u32 *)user_va = 8;
-	rb = *(u32 *)user_va;
-    pr_info("[br_cxl_init] wrote 0x%x, read back 0x%x\n", 8, rb);
 }
 
-void cxl_mem_deinit(void)
+void cxl_sender_mem_init(void)
 {
-	if (vaddr_cxl) {
-        memunmap(vaddr_cxl);
-        vaddr_cxl = NULL;
-    }
-    pr_info("[br_cxl_deinit] unmapped and exit\n");
+	cxl_offset_mem_init();
 }
-static struct kmem_cache *cxl_test_cache;
-static void test_cxl_slab_alloc(int node_id, size_t size)
+
+void cxl_recv_mem_init(void)
 {
-    void *obj;
-    struct page *pg;
-    phys_addr_t phys;
-
-    printk(KERN_INFO "[CXL-SLAB-TEST] Creating kmem_cache(size=%zu)\n", size);
-
-    cxl_test_cache = kmem_cache_create("cxl_slab_test_cache",
-                                       size,
-                                       0,
-                                       SLAB_HWCACHE_ALIGN,
-                                       NULL);
-    if (!cxl_test_cache) {
-        printk(KERN_ERR "[CXL-SLAB-TEST] kmem_cache_create failed.\n");
-        return;
-    }
-    printk(KERN_INFO "[CXL-SLAB-TEST] Allocating from node %d ...\n", node_id);
-
-    obj = kmem_cache_alloc_node(cxl_test_cache, GFP_HIGHUSER_MOVABLE, node_id);
-    if (!obj) {
-        printk(KERN_ERR "[CXL-SLAB-TEST] kmem_cache_alloc_node FAILED on node %d\n",
-               node_id);
-        goto out;
-    }
-
-    pg = virt_to_page(obj);
-    phys = page_to_phys(pg);
-
-    printk(KERN_INFO "[CXL-SLAB-TEST] Allocation succeeded!\n");
-    printk(KERN_INFO "[CXL-SLAB-TEST] Virtual addr: %px\n", obj);
-    printk(KERN_INFO "[CXL-SLAB-TEST] Page frame number: %lu\n", page_to_pfn(pg));
-    printk(KERN_INFO "[CXL-SLAB-TEST] Physical addr: 0x%llx\n", (unsigned long long) phys);
-    printk(KERN_INFO "[CXL-SLAB-TEST] Allocated on NUMA node: %d\n", page_to_nid(pg));
-
-    if (page_to_nid(pg) == node_id)
-        printk(KERN_INFO "[CXL-SLAB-TEST] SUCCESS: Slab allocated on CXL node %d!\n", node_id);
-    else
-        printk(KERN_WARNING "[CXL-SLAB-TEST] WARNING: Slab NOT allocated on requested node %d.\n",
-                            node_id);
-
-out:
-    if (cxl_test_cache) {
-        kmem_cache_destroy(cxl_test_cache);
-        cxl_test_cache = NULL;
-    }
+	cxl_offset_mem_init();
+	cxl_numa_mem_init();
 }
 
-
-void show_zonelist(void)
+void cxl_sender_mem_deinit(void)
 {
-	int nid;
-
-    for (nid = 0; nid < nr_node_ids; nid++) {
-        struct zonelist *zl;
-        struct zoneref *zref;
-        int gfp_idx = gfp_zonelist(GFP_KERNEL);
-
-        pr_info("=== NUMA Node %d ===\n", nid);
-        zl = NODE_DATA(nid)->node_zonelists + gfp_idx;
-
-        for (zref = zl->_zonerefs; zref->zone; zref++) {
-            struct zone *z = zref->zone;
-            pr_info("  zonelist entry: node %d zone %s\n",
-                    zone_to_nid(z),
-                    z->name);
-        }
-    }
-
+	cxl_offset_mem_deinit();
 }
-void test_alloc_from_cxl(void)
+
+void cxl_recv_mem_deinit(void)
 {
-	int nid = 1; // 你的 CXL node
-    struct page *page;
-
-    // 试一个“可移动”的分配
-    page = alloc_pages_node(nid, GFP_HIGHUSER_MOVABLE, 0);
-    if (!page) {
-        pr_info("alloc_pages_node(%d, GFP_HIGHUSER_MOVABLE) failed\n", nid);
-    }
-	phys_addr_t phys = (phys_addr_t)page_to_pfn(page) << PAGE_SHIFT;
-	pr_info("CXL frag: page=%p, page_phys=0x%llx\n",page,(unsigned long long)phys);
-    pr_info("GFP_HIGHUSER_MOVABLE: got page on nid=%d\n", page_to_nid(page));
-
-    __free_pages(page, 0);
+	cxl_offset_mem_deinit();
+	cxl_numa_mem_deinit();
 }
-
 
 
 static int __init br_init(void)
@@ -518,12 +458,11 @@ static int __init br_init(void)
 		pr_err("bridge: can't register sap for STP\n");
 		return err;
 	}
-
-	// cxl_mem_init();
-	// show_zonelist();
-	// test_alloc_from_cxl();
-
-	test_cxl_slab_alloc(1, 256);
+	#if SENDER_FEATURE
+		cxl_sender_mem_init();
+	#elif RECV_FEATURE
+		cxl_recv_mem_init();
+	#endif
 
 	err = br_fdb_init();
 	if (err)
@@ -586,7 +525,13 @@ err_out:
 
 static void __exit br_deinit(void)
 {
-	cxl_mem_deinit();
+	#if SENDER_FEATURE
+		cxl_sender_mem_deinit();		
+	#elif RECV_FEATURE
+		cxl_recv_mem_deinit();
+	#endif
+
+	
 	stp_proto_unregister(&br_stp_proto);
 	br_netlink_fini();
 	unregister_switchdev_blocking_notifier(&br_switchdev_blocking_notifier);

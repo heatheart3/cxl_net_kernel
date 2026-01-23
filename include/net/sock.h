@@ -2568,8 +2568,7 @@ static inline void sk_stream_moderate_sndbuf(struct sock *sk)
 static inline struct page_frag *sk_page_frag(struct sock *sk)
 {
 	if (sk->sk_use_task_frag)
-		return &current->task_frag;
-
+		return &current->task_frag;	
 	return &sk->sk_frag;
 }
 
