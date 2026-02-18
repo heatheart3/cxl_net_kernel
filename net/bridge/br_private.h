@@ -63,14 +63,18 @@ typedef struct mac_addr mac_addr;
 typedef __u16 port_id;
 
 struct skb_location_enrty{
-	u64 offset;
+	u32 offset;
 	u32 size;
 	u64 pfn;
-	char blank[12];
+	char blank[48];
 };
-
+struct skb_header_entry{
+	u32 size;
+	char content[124];
+};
+// entry size  = 64+128 = 192
 struct cxl_skb_entry{
-	struct skb_location_enrty header;
+	struct skb_header_entry header;
 	struct skb_location_enrty payload;
 };
 

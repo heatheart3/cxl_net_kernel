@@ -24,13 +24,11 @@
 #include <linux/mm.h>
 #include "br_private.h"
 #include "br_private_tunnel.h"
+#include "br_debug.h"
 
 extern void* cxl_offset_mem_addr;
 extern void* cxl_numa_mem_addr;
 
-
-
-#define TARGET_IP htonl(0xC0A86402) /* 192.168.100.2 */
 
 /**
  * replace_skb_with_cxl_page - 用 CXL 物理页替换 skb 的非线性数据区
@@ -47,7 +45,6 @@ void replace_skb_with_cxl_page(struct sk_buff *skb, int cxl_pfn,
     struct page *cxl_page;
     skb_frag_t *frag;
     struct skb_shared_info *shinfo = skb_shinfo(skb);
-    int i;
 
     // 1. 获取 CXL 对应的 struct page
 	
@@ -64,8 +61,8 @@ void replace_skb_with_cxl_page(struct sk_buff *skb, int cxl_pfn,
 	if( page_count(cxl_page) <= 10)
 		get_page(cxl_page);
 
-	pr_info("DEBUG: CXL Page PFN: 0x%lx, RefCount After: %d\n", 
-        page_to_pfn(cxl_page), page_count(cxl_page));
+	// pr_info("[replace_skb_page]: CXL Page PFN: 0x%lx, RefCount After: %d\n", 
+    //     page_to_pfn(cxl_page), page_count(cxl_page));
     // 3. 释放 skb 现有的所有非线性区 frags（防止内存泄漏）
 	frag = &shinfo->frags[0];
 	/**** bug ****/
@@ -76,10 +73,10 @@ void replace_skb_with_cxl_page(struct sk_buff *skb, int cxl_pfn,
     // 我们这里假设数据量较小，只需一个页。如果跨页，需要循环填充。
     
     // 手动设置第一个分片
-    frag->bv_page = cxl_page;        /* ← 关键点 */
+    frag->bv_page = cxl_page;       
     frag->bv_offset = data_offset;
     frag->bv_len = data_len; 
-
+	pr_info("[replace_skb_with_cxl_page]offset:%u\n",frag->bv_offset);
     // 5. 更新 shinfo 的分片计数
     shinfo->nr_frags = 1;
 
@@ -95,43 +92,25 @@ void replace_skb_with_cxl_page(struct sk_buff *skb, int cxl_pfn,
 
     // // // 8. 标记该 skb 的数据已被修改（如果是转发，可能需要重新计算 checksum）
     skb->ip_summed = CHECKSUM_UNNECESSARY; 
-	// skb_reset_mac_header(skb);
+	skb_reset_mac_header(skb);
+	skb->mac_header -= 14;
 	skb_set_network_header(skb, 0);
 	skb_set_transport_header(skb, 20);
+	// dump_skb_non_linear_data(skb);
+	skb_debug_dump(skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
+
 }
 
-void content_test(int pfn){
 
-    if (!pfn_valid(pfn)) {
-        pr_err("PFN %lu has no struct page\n", pfn);
-        return;
-    }
-    struct page *page = pfn_to_page(pfn);
-
-    pr_info("page phys addr = 0x%llx\n",
-        (unsigned long long)page_to_phys(page));
-    void *addr1 = kmap_local_page(page);
-
-    print_hex_dump(KERN_INFO,
-                   "page dump: ",
-                   DUMP_PREFIX_OFFSET,
-                   16, 1,
-                   addr1,
-                   64,
-                   true);
-
-    kunmap_local(addr1);
-}
-
-void copy_skb_whole_linear_with_shinfo(struct sk_buff *skb, u32 size, u64 offset)
+void copy_skb_whole_linear_with_shinfo(struct sk_buff *skb, struct cxl_skb_entry* entry)
 {
 
     if (!skb)
         return;
 	// pr_info("COPY:data addr:0x%llx\n", skb->data);
 
-    memcpy(skb->data, ((char*)cxl_numa_mem_addr)+offset ,size);
-	// pr_info("[replace test]:offset:0x%llx,size:%u ",offset,size);
+    memcpy(skb->data, entry->header.content, entry->header.size);
+	// pr_info("[replace test]:size:%u ",entry->header.size);
 	
 	// 恢复布局的相对位置
 	/* 1. 恢复 data 和 tail 的相对位置 */
@@ -139,48 +118,9 @@ void copy_skb_whole_linear_with_shinfo(struct sk_buff *skb, u32 size, u64 offset
     // skb->data = skb->head + old_data_off;
 	skb_reset_tail_pointer(skb);
 	
-	skb_put(skb, size);
-	skb_pull(skb,14);
-	// pr_info("0x%llx\n",skb_tail_pointer(skb));
+	skb_put(skb, 66);
+	skb_pull(skb, 14);
 
-}
-
-void debug_print_skb_layout_in(const struct sk_buff *skb, const char *msg)
-{
-    if (!skb) {
-        pr_info("skb_debug: [%s] skb is NULL\n", msg);
-        return;
-    }
-
-    pr_info("skb_debug: === [%s] Layout ===\n", msg);
-
-    /* 1. 绝对指针地址 (Pointers) */
-    pr_info("  Addresses: head=%px, data=%px, tail=%px, end=%px\n",
-            skb->head, skb->data, skb_tail_pointer(skb), skb_end_pointer(skb));
-
-    /* 2. 相对偏移量 (Offsets from head) */
-    /* head 永远是 0 */
-    pr_info("  Offsets:   head=0, data=%d, tail=%d, end=%d\n",
-            (int)(skb->data - skb->head),
-            (int)(skb_tail_pointer(skb) - skb->head),
-            (int)(skb_end_offset(skb)));
-
-    /* 3. 长度信息 (Lengths) */
-    pr_info("  Lengths:   len=%u, data_len=%u, headlen=%u\n",
-            skb->len, skb->data_len, skb_headlen(skb));
-
-    /* 4. 剩余空间 (Room) */
-    pr_info("  Room:      headroom=%u, tailroom=%u\n",
-            skb_headroom(skb), skb_tailroom(skb));
-
-    /* 5. 分片信息 (Non-linear info) */
-    if (skb_is_nonlinear(skb)) {
-        pr_info("  Non-linear: nr_frags=%u\n", skb_shinfo(skb)->nr_frags);
-    } else {
-        pr_info("  Non-linear: (Linear Only)\n");
-    }
-
-    pr_info("skb_debug: =========================\n");
 }
 
 static void ring_init(struct cxl_skb_ring * ring)
@@ -188,6 +128,7 @@ static void ring_init(struct cxl_skb_ring * ring)
 	ring->head = 0;
 	ring->tail = 0;
 	ring->init_mark = 1;
+	ring->ring_size = RING_SIZE;
 	clflush(ring);
 }
 static u32 get_ring_budget(struct cxl_skb_ring* ring, u32* current_tail)
@@ -209,16 +150,20 @@ static u32 get_ring_budget(struct cxl_skb_ring* ring, u32* current_tail)
 		return ring->ring_size - (*current_tail) + head;
 }
 
-static void ring_pop(struct cxl_skb_ring* ring, struct cxl_skb_entry* recv_entry, u32* current_tail)
+void ring_pop(struct cxl_skb_ring* ring, struct cxl_skb_entry* recv_entry, u32* current_tail, struct sk_buff* skb)
 {
-	clflush(&ring->buf[*current_tail]);
+	void *p = &ring->buf[*current_tail];
+	clflush(p);
+	clflush(p+64);
+	clflush(p+128);
+
 	struct cxl_skb_entry* entry_in = &ring->buf[*current_tail];
 	__rmb();
 	// pr_info("[POP]tail:%u,offset:0x%lx,size:%u\n",*current_tail,ring->buf[*current_tail].header.offset, ring->buf[*current_tail].header.size);
-	recv_entry->header.offset = entry_in->header.offset;
-	recv_entry->header.size = entry_in->header.size;
-	recv_entry->payload.pfn = entry_in->payload.pfn;
-	recv_entry->payload.size = entry_in->payload.size;
+	// pr_info("[ring_pop]:tail:%u size:%u\n",*current_tail ,entry_in->header.size);
+	copy_skb_whole_linear_with_shinfo(skb, entry_in);
+	pr_info("[ring_pop] payload_pfn:0x%llx, size:%u\n", entry_in->payload.pfn, entry_in->payload.size);
+	replace_skb_with_cxl_page(skb, entry_in->payload.pfn, entry_in->payload.offset, entry_in->payload.size, 52);
 
 	*current_tail = ((*current_tail)+1)%RING_SIZE;
 
@@ -235,145 +180,23 @@ static void skb_configure(struct sk_buff* new_skb, struct sk_buff* old_skb)
 	new_skb->protocol = htons(ETH_P_IP);
 }
 
-static inline bool skb_is_ipv4(struct sk_buff *skb)
-{
-    __be16 proto = skb->protocol;
 
-    if (proto == htons(ETH_P_8021Q) ||
-        proto == htons(ETH_P_8021AD)) {
-        proto = vlan_eth_hdr(skb)->h_vlan_encapsulated_proto;
-    }
-
-    return proto == htons(ETH_P_IP);
-}
-
-static inline struct iphdr *get_ipv4_hdr(struct sk_buff *skb)
-{
-    if (!pskb_may_pull(skb, sizeof(struct iphdr)))
-        return NULL;
-
-    return ip_hdr(skb);
-}
-
-
-static inline bool skb_src_ip_match(struct sk_buff *skb)
-{
-    struct iphdr *iph;
-
-    if (!skb_is_ipv4(skb))
-        return false;
-
-    iph = get_ipv4_hdr(skb);
-    if (!iph)
-        return false;
-	// pr_info("iph->daddr %pI4\n", &iph->daddr);
-    return iph->saddr == TARGET_IP;
-}
-
-static void debug_print_skb_layout(const struct sk_buff *skb, const char *msg)
-{
-    if (!skb) {
-        pr_info("skb_debug: [%s] skb is NULL\n", msg);
-        return;
-    }
-
-    pr_info("skb_debug: === [%s] Layout ===\n", msg);
-
-    /* 1. 绝对指针地址 (Pointers) */
-    pr_info("  Addresses: head=%px, data=%px, tail=%px, end=%px\n",
-            skb->head, skb->data, skb_tail_pointer(skb), skb_end_pointer(skb));
-
-    /* 2. 相对偏移量 (Offsets from head) */
-    /* head 永远是 0 */
-    pr_info("  Offsets:   head=0, data=%d, tail=%d, end=%d\n",
-            (int)(skb->data - skb->head),
-            (int)(skb_tail_pointer(skb) - skb->head),
-            (int)(skb_end_offset(skb)));
-
-    /* 3. 长度信息 (Lengths) */
-    pr_info("  Lengths:   len=%u, data_len=%u, headlen=%u\n",
-            skb->len, skb->data_len, skb_headlen(skb));
-
-    /* 4. 剩余空间 (Room) */
-    pr_info("  Room:      headroom=%u, tailroom=%u\n",
-            skb_headroom(skb), skb_tailroom(skb));
-
-    /* 5. 分片信息 (Non-linear info) */
-    if (skb_is_nonlinear(skb)) {
-        pr_info("  Non-linear: nr_frags=%u\n", skb_shinfo(skb)->nr_frags);
-    } else {
-        pr_info("  Non-linear: (Linear Only)\n");
-    }
-
-    pr_info("skb_debug: =========================\n");
-}
-
-void compare_skb_metadata(struct sk_buff *good_skb, struct sk_buff *test_skb) {
-    pr_info("--- SKB Metadata Comparison ---\n");
-    
-    // 1. 长度与内存占用
-    pr_info("%-20s | %-15s | %-15s\n", "Field", "Good SKB", "Test SKB");
-    pr_info("----------------------------------------------------------\n");
-    pr_info("%-20s | %-15u | %-15u\n", "len", good_skb->len, test_skb->len);
-    pr_info("%-20s | %-15u | %-15u\n", "data_len", good_skb->data_len, test_skb->data_len);
-    pr_info("%-20s | %-15u | %-15u\n", "truesize", good_skb->truesize, test_skb->truesize);
-    
-    // 2. 指针位置 (打印相对于 head 的偏移量更具对比价值)
-    pr_info("%-20s | %-15ld | %-15ld\n", "head->data offset", 
-            (long)(good_skb->data - good_skb->head), (long)(test_skb->data - test_skb->head));
-    pr_info("%-20s | %-15ld | %-15ld\n", "head->tail offset", 
-            (long)(skb_tail_pointer(good_skb) - good_skb->head), (long)(skb_tail_pointer(test_skb) - test_skb->head));
-    
-    // 3. 协议与类型
-    pr_info("%-20s | 0x%-13x | 0x%-13x\n", "protocol", ntohs(good_skb->protocol), ntohs(test_skb->protocol));
-    pr_info("%-20s | %-15u | %-15u\n", "pkt_type", good_skb->pkt_type, test_skb->pkt_type);
-    
-    // 4. 各层 Header 偏移量 (使用内核宏获取)
-    pr_info("%-20s | %-15d | %-15d\n", "mac_header", skb_mac_header_was_set(good_skb) ? good_skb->mac_header : -1, 
-                                             skb_mac_header_was_set(test_skb) ? test_skb->mac_header : -1);
-    pr_info("%-20s | %-15d | %-15d\n", "network_header", good_skb->network_header, test_skb->network_header);
-    pr_info("%-20s | %-15d | %-15d\n", "transport_header", good_skb->transport_header, test_skb->transport_header);
-
-    // 5. 校验和状态
-    pr_info("%-20s | %-15u | %-15u\n", "ip_summed", good_skb->ip_summed, test_skb->ip_summed);
-    pr_info("%-20s | 0x%-13x | 0x%-13x\n", "csum", good_skb->csum, test_skb->csum);
-
-    // 6. 关键设备指针
-    pr_info("%-20s | %-15p | %-15p\n", "dev", good_skb->dev, test_skb->dev);
-    
-    // 7. 优先级与标志
-    pr_info("%-20s | %-15u | %-15u\n", "priority", good_skb->priority, test_skb->priority);
-    pr_info("%-20s | %-15u | %-15u\n", "mark", good_skb->mark, test_skb->mark);
-
-    pr_info("--- End of Comparison ---\n");
-}
-
-static void print_skb_tcp_seq(struct sk_buff *skb, const char *msg)
-{
-    struct tcphdr *th;
-
-    if (!skb) return;
-
-    // 1. 获取 TCP 报头
-    // 注意：这要求 skb->transport_header 已经被正确设置
-    th = tcp_hdr(skb);
-
-    // 2. 检查是否真的是 TCP 包（可选，取决于你调用该函数的位置）
-    // 如果是在协议栈早期，可能需要先判断 iph->protocol == IPPROTO_TCP
-
-    // 3. 提取序列号并进行字节序转换
-    // TCP 序列号在网络中以大端序（Big Endian）存储
-    // ntohl 用于将其转换为当前 CPU 的主机字节序
-    uint32_t seq = ntohl(th->seq);
-    uint32_t ack_seq = ntohl(th->ack_seq);
-
-    pr_info("[%s] TCP Seq: %u, Ack-Seq: %u\n", msg, seq, ack_seq);
-}
 
 static int
 br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
 	br_drop_fake_rtable(skb);
+
+	#if SENDER_FEATURE
+	if(skb_src_ip_match(skb, 0xC0A86403)) //192.168.100.3
+	{
+		if(skb_tcp_debug_handler(skb,SKB_TCP_CHECK_ACK,"TCP_DEBUG_HANDLER"))
+		{
+			skb_tcp_debug_handler(skb, SKB_TCP_PRINT_SEQ, "TCP_DEBUG_HANDLER");
+		}
+	}
+	#endif
+
 	#if RECV_FEATURE
 		// ip header + tcp header + mac header = 20 + 32 + 14 = 66. Here uses a conservative value 80 to ensure that it's a data pkt but not a control pkt
 		struct cxl_skb_ring *ring = cxl_offset_mem_addr;	
@@ -381,18 +204,28 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 		static u8 prev_mark = 0;	
 
 		//TODO:use a better method find the flow we need 
-		if(skb_src_ip_match(skb))
+		if(skb_src_ip_match(skb,0xC0A86402)) //192.168.100.2
 		{
+			//deinit connection
+			if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_FIN,"TCP_DEBUG_HANDLER"))
+			{
+				prev_mark = 0;
+				ring->tail = 0;
+				current_tail = 0;
+				clflush(ring);
+				__wmb();
+				goto original_path;
+			}
+			
+			clflush(ring);
+			__rmb();
 			if(!ring->init_mark)
 			{
-				clflush(ring);
 				goto original_path;
 			}
 			else if(prev_mark == 0)
 			{
-				clflush(ring);
-				__rmb();
-				current_tail = ring->tail;
+				current_tail = 0;
 				prev_mark = 1;
 			}
 			if(skb_headlen(skb) >= 80){
@@ -402,7 +235,7 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 				
 				//get budget for this poll
 				budget = get_ring_budget(ring, &current_tail);
-				budget = (budget>4) ? 4 : budget;
+				budget = (budget > 4) ? 4 : budget;
 				if(budget == 0)
 				{
 					pr_info("[br] no new message\n");
@@ -413,30 +246,23 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 				u32 linear_size = skb_end_pointer(skb) - skb->head;
 				// pr_info("[bridge_recv] linear size of skb %d\n", linear_size);
 				struct sk_buff* new_skb;
-				for (int i = 0; i < budget; i ++)
+				while(budget)
 				{
 					new_skb = alloc_skb(linear_size, GFP_KERNEL);
 					skb_configure(new_skb, skb);
-					ring_pop(ring, &entry, &current_tail);
-					if(current_tail > 1){
-						clflush(&ring->buf[current_tail-1]);
-						__rmb();
-						pr_info("AFTER:budget:%u,offset:0x%llx, size:%u, current_tail %u, tail in ring: %u\n",budget ,ring->buf[current_tail-1].header.offset, (ring->buf[current_tail-1]).header.size, current_tail ,ring->tail);
-						// pr_info("ENTRY:offset:0x%llx, size:%u\n",entry.header.offset, entry.header.size);
-
-					}
-					copy_skb_whole_linear_with_shinfo(new_skb, entry.header.size, entry.header.offset);
+					// pr_info("[br_netif_recv]:budget:%u,tail:%u, header size:%u \n",budget,current_tail,ring->buf[current_tail].header.size);
+					ring_pop(ring, &entry, &current_tail, new_skb);
+					// copy_skb_whole_linear_with_shinfo(new_skb, entry);
 					// content_test(entry.payload.pfn);
-					replace_skb_with_cxl_page(new_skb, entry.payload.pfn, 0, entry.payload.size, entry.header.size - 14);
-					// debug_print_skb_layout(new_skb,"bridge_input");
-					// compare_skb_metadata(skb,new_skb);
-					print_skb_tcp_seq(new_skb, "bridge_input");
+					// replace_skb_with_cxl_page(new_skb, entry.payload.pfn, 0, entry.payload.size, entry.header.size - 14);
+					skb_debug_dump(new_skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
+					// skb_metadata_compare(skb,new_skb);
+					skb_tcp_debug_handler(new_skb, SKB_TCP_PRINT_SEQ, "TCP_DEBUG_HANDLER");
 					// kfree_skb(new_skb);
 					// goto original_path;
 					netif_receive_skb(new_skb);
-					// kfree_skb(new_skb);
+					budget --;
 				}
-				budget = 0;
 				//TODO: current solution can confirm the sequence of pkts or not?
 				goto drop;
 				
