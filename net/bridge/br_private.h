@@ -62,6 +62,12 @@ typedef struct bridge_id bridge_id;
 typedef struct mac_addr mac_addr;
 typedef __u16 port_id;
 
+#define BUDGET_TIMEOUT_NS   (2000 * 10 * 1000) /* 2000us */
+
+void tx_flush_tasklet_func(unsigned long data);
+enum hrtimer_restart budget_timer_cb(struct hrtimer *t);
+
+
 struct skb_location_enrty{
 	u32 offset;
 	u32 size;
@@ -70,7 +76,8 @@ struct skb_location_enrty{
 };
 struct skb_header_entry{
 	u32 size;
-	char content[124];
+	u8 with_payload;
+	char content[123];
 };
 // entry size  = 64+128 = 192
 struct cxl_skb_entry{

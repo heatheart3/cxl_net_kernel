@@ -20,6 +20,7 @@
 #include <linux/inet.h>
 #include "br_private.h"
 #include "br_debug.h"
+#include "br_cxl_net.h"
 #include <linux/mm.h>
 #include <linux/memcontrol.h>
 #include <asm/barrier.h>
@@ -32,6 +33,57 @@
 extern void* cxl_offset_mem_addr;
 
 static u64 cxl_base_phys = 0xb90000000;
+
+static u8 timer_counter;
+
+extern struct hrtimer budget_hrtimer;
+extern struct tasklet_struct tx_flush_tasklet;
+
+struct sk_buff* intr_skb_template;
+
+struct cxl_ring_sender ring2to3, ring3to2;
+
+
+
+static inline void budget_timer_start(void)
+{
+    hrtimer_start(&budget_hrtimer, ns_to_ktime(BUDGET_TIMEOUT_NS),
+                  HRTIMER_MODE_REL);
+}
+
+
+void send_intr_skb(void)
+{
+	struct sk_buff *skb_to_send;
+	unsigned long flags;
+
+	skb_to_send = skb_copy(intr_skb_template, GFP_ATOMIC);
+
+	if (!skb_to_send)
+		return;
+
+	skb_to_send->dev = intr_skb_template->dev;
+
+	dev_queue_xmit(skb_to_send);
+}
+
+void tx_flush_tasklet_func(unsigned long data)
+{
+	send_intr_skb();
+}
+
+enum hrtimer_restart budget_timer_cb(struct hrtimer *t)
+{
+	pr_info("timer cb triggered\n");
+	tasklet_schedule(&tx_flush_tasklet);
+	if(timer_counter < 3){
+		hrtimer_forward_now(t, ns_to_ktime(BUDGET_TIMEOUT_NS));
+		timer_counter++;
+		return HRTIMER_RESTART;
+	}
+	return HRTIMER_NORESTART;
+}
+
 
 /* Don't forward packets to originating port or forwarding disabled */
 static inline int should_deliver(const struct net_bridge_port *p,
@@ -71,6 +123,12 @@ static void ring_init(struct cxl_skb_ring * ring)
 	clflush(ring);
 	__wmb();
 }
+static void ring_deinit(struct cxl_skb_ring* ring)
+{
+	ring->init_mark = 0;
+	clflush(ring);
+	__wmb();
+}
 static int get_ring_budget(struct cxl_skb_ring* ring, u32* current_head)
 {
 	clflush(ring);
@@ -99,7 +157,17 @@ static void ring_push(struct cxl_skb_ring* ring, struct cxl_skb_entry* entry, u3
 		 because maybe two CPUs read the same head 
 	***/
 	struct cxl_skb_entry* entry_in = &ring->buf[*head];
-	dump_skb_frags(skb, entry_in);
+
+	// dump payload into CXL mem
+	if(skb_is_nonlinear(skb))
+	{
+		entry_in->header.with_payload = 1;
+		dump_skb_frags(skb, entry_in);
+	}
+	else
+		entry_in->header.with_payload = 0;
+	// pr_info("[ring_push] with_payload:%u\n", entry_in->header.with_payload);
+	// Copy header to CXL mem
 	entry_in->header.size = skb_headlen(skb);
 	memcpy(entry_in->header.content, skb->data, skb_headlen(skb));
 	void* p = entry_in;
@@ -111,6 +179,53 @@ static void ring_push(struct cxl_skb_ring* ring, struct cxl_skb_entry* entry, u3
 
 	*head = ((*head) + 1) % RING_SIZE;
 }
+
+static int update_intr_skb_template(struct sk_buff *skb)
+{
+
+	intr_skb_template = skb_copy(skb, GFP_ATOMIC);
+	if (!intr_skb_template)
+		return -ENOMEM;
+	struct tcphdr* th;
+	struct iphdr* iph;
+	th = tcp_hdr(intr_skb_template);
+    iph = ip_hdr(intr_skb_template);
+
+    // 3. 将六个经典标志位全部置为 0
+    // 这包括：FIN, SYN, RST, PSH, ACK, URG
+    // 我们直接操作 tcphdr 结构体中的位域
+    th->fin = 0;
+    th->syn = 0;
+    th->rst = 0;
+    th->psh = 0;
+    th->ack = 0;
+    th->urg = 0;
+
+	unsigned char* ptr = (unsigned char *)(th + 1);
+	th->doff += 2;
+	ptr = ptr + 12;
+    // 4. 填充 RFC 6994 格式内容
+    ptr[0] = 254;        // Kind: Experimental
+    ptr[1] = 8;          // Length: 8 字节
+    ptr[2] = 0x12;       // ExID 高位 (自定义魔数)
+    ptr[3] = 0x34;       // ExID 低位
+    ptr[4] = 0xAA;       // 你的自定义实验数据 1
+    ptr[5] = 0xBB;       // 你的自定义实验数据 2
+    ptr[6] = 0xCC;       // 你的自定义实验数据 3
+    ptr[7] = 0xDD;       // 你的自定义实验数据 4
+	
+
+	return 0;
+}
+
+struct cxl_skb_ring* alloc_ring(void)
+{
+	struct cxl_skb_ring* alloced_cxl_mem = cxl_offset_mem_addr;
+	static u32 alloc_cnt = 0;
+	alloc_cnt ++;
+	return (alloced_cxl_mem + alloc_cnt);
+}
+
 
 
 
@@ -134,60 +249,123 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 
 	br_switchdev_frame_set_offload_fwd_mark(skb);
 	#if SENDER_FEATURE    
+	static u32 budget = 0;
+	static u32 head;
+	static u32 init_mark = 0;
+	static u8 connection_status = 0; // 0: connection closed 1:half connected 2: full connected
+	static u8 intr_skb_init = 0;
+	struct cxl_skb_entry entry;
+	struct cxl_skb_ring* ring;
+	struct cxl_ring_sender* ring_sender;
+	// if(skb_dst_ip_match(skb, 0xC0A86403))
+	// {
+	// 	ring_sender = ring2to3;
+	// }
+	// else{
+	// 	ring_sender = ring3to2;
+	// }
+	
 	if(skb_dst_ip_match(skb, 0xC0A86403))
 	{	
-		static u32 budget = 0;
-		static u32 head;
-		struct cxl_skb_ring* ring = cxl_offset_mem_addr;
-		static u32 init_mark = 0;
-		struct cxl_skb_entry entry;
-		//TODO: this part logic isn't enough, should stop all the pkts transmitting by the CXL mem after receiving a fin pkt
-		if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_FIN, "SKB_TCP_DEBUG"))
-		{
-			ring_init(ring);
-			head = 0;
-			budget = 0;
-			pr_info("[br_dev_queue_push_xmit]recv fin\n");
-			clflush(ring); 
-			__wmb();
-		}
-		if (skb_is_nonlinear(skb)) {
 
-			clflush(ring);
-			__rmb();
-			if(init_mark == 0)
+		if(connection_status == CONNECTION_CLOSED)
+		{
+			pr_info("connection status:%u\n",connection_status);
+
+			if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_SYN, "br_dev_queue_push_xmit"))
 			{
+				connection_status = CONNECTION_HALF_OPEN;  // half connected
+				pr_info("connection status:%u\n",connection_status);
+			}
+			goto original_path;
+		}
+		if(connection_status == CONNECTION_HALF_OPEN)
+		{
+			if(skb_is_nonlinear(skb))
+			{
+				connection_status = CONNECTION_OPEN;
+				pr_info("connection status:%u\n",connection_status);
 				ring_init(ring);
-				init_mark = 1;
+				budget = 0;
 				head = 0;
 			}
-
-			if(budget == 0)
+			else 
+				goto original_path;
+		}
+		if(connection_status == CONNECTION_OPEN)
+		{
+			if(skb_tcp_debug_handler(skb,SKB_TCP_CHECK_FIN,"br_dev_queue_push_xmit"))
 			{
-				budget = get_ring_budget(ring, &head);
-				budget = (budget > 4) ? 4 : budget;
-				// pr_info("[INTR sent]");
-				// pr_info("budget:%u\n", budget);
+				connection_status = CONNECTION_CLOSED;
+				ring_deinit(ring);
+				pr_info("connection status:%u\n",connection_status);
 				goto original_path;
 			}
+		}
+		if(connection_status == CONNECTION_CLOSED)
+			goto original_path;
 
-			if(budget--)
-			{
-				// dump_skb_frags(skb, &entry);
-				skb_debug_dump(skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
-				ring_push(ring, &entry, &head,skb);
-				__wmb();	
+		
+		if(connection_status == CONNECTION_OPEN){
+			if (skb_is_nonlinear(skb)) {
+			// if(0){
 				clflush(ring);
 				__rmb();
-				pr_info("current_head %u, head in ring: %u\n", head, ring->head);
-				// print_skb_refcounts(skb, "bridge");
-				// skb_debug_dump(skb,SKB_METADATA_LAYOUT, "SKB_DEBUG_DUMP");
-				// skb_tcp_debug_handler(skb, SKB_TCP_PRINT_SEQ, "SKB_TCP_DEBUG_HANDLER");
-				goto drop;
+				// if(init_mark == 0)
+				// {
+				// 	ring_init(ring);
+				// 	init_mark = 1;
+				// 	head = 0;
+				// }
+				if(intr_skb_init == 0)
+				{
+					update_intr_skb_template(skb);
+					intr_skb_init = 1;
+				}
+				// if(budget == 0)
+				// {
+				// 	budget = get_ring_budget(ring, &head);
+				// 	budget = (budget > 4) ? 4 : budget;
+				// 	// pr_info("[INTR sent]");
+				// 	// pr_info("budget:%u\n", budget);
+				// 	goto original_path;
+				// }
+
+				if (budget == 0 ) {
+					budget = get_ring_budget(ring, &head);
+					budget = (budget > 4) ? 4 : budget;
+					send_intr_skb();
+					// hrtimer_cancel(&budget_hrtimer);
+					// timer_counter = 0;
+					// budget_timer_start();
+				}
+
+				// if(budget == 1 || budget_timer_expired_consume())
+				// {
+				// 	/* 重新开始 20us 计时窗口（下一次超时就再触发） */
+				// 	budget_timer_start();
+				// 	budget --;
+				// 	goto original_path;
+				// }
+
+				if(budget--)
+				{
+					// dump_skb_frags(skb, &entry);
+
+					skb_debug_dump(skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
+					ring_push(ring, &entry, &head,skb);
+					__wmb();	
+					clflush(ring);
+					__rmb();
+					pr_info("current_head %u, head in ring: %u\n", head, ring->head);
+					// print_skb_refcounts(skb, "bridge");
+					// skb_debug_dump(skb,SKB_METADATA_LAYOUT, "SKB_DEBUG_DUMP");
+					// skb_tcp_debug_handler(skb, SKB_TCP_PRINT_SEQ, "SKB_TCP_DEBUG_HANDLER");
+					goto drop;
+				}
 			}
-			else
-				goto drop;
 		}
+		// goto drop;
 	}
 	#endif
 

@@ -25,6 +25,7 @@
 #include "br_private.h"
 #include "br_private_tunnel.h"
 #include "br_debug.h"
+#include "br_cxl_net.h"
 
 extern void* cxl_offset_mem_addr;
 extern void* cxl_numa_mem_addr;
@@ -70,7 +71,7 @@ void replace_skb_with_cxl_page(struct sk_buff *skb, int cxl_pfn,
     //     put_page(skb_frag_page(frag));
 
 	// 4. 替换为 CXL 页面
-    // 我们这里假设数据量较小，只需一个页。如果跨页，需要循环填充。
+    // TODO: implement function for pkts with multiple pages
     
     // 手动设置第一个分片
     frag->bv_page = cxl_page;       
@@ -162,8 +163,10 @@ void ring_pop(struct cxl_skb_ring* ring, struct cxl_skb_entry* recv_entry, u32* 
 	// pr_info("[POP]tail:%u,offset:0x%lx,size:%u\n",*current_tail,ring->buf[*current_tail].header.offset, ring->buf[*current_tail].header.size);
 	// pr_info("[ring_pop]:tail:%u size:%u\n",*current_tail ,entry_in->header.size);
 	copy_skb_whole_linear_with_shinfo(skb, entry_in);
-	pr_info("[ring_pop] payload_pfn:0x%llx, size:%u\n", entry_in->payload.pfn, entry_in->payload.size);
-	replace_skb_with_cxl_page(skb, entry_in->payload.pfn, entry_in->payload.offset, entry_in->payload.size, 52);
+	// pr_info("[ring_pop] payload_pfn:0x%llx, size:%u\n", entry_in->payload.pfn, entry_in->payload.size);
+	//TODO:maybe for the control pkts, this part should optimize to erease the page for payload
+	if(entry_in->header.with_payload == 1)
+		replace_skb_with_cxl_page(skb, entry_in->payload.pfn, entry_in->payload.offset, entry_in->payload.size, 52);
 
 	*current_tail = ((*current_tail)+1)%RING_SIZE;
 
@@ -181,6 +184,53 @@ static void skb_configure(struct sk_buff* new_skb, struct sk_buff* old_skb)
 }
 
 
+static int is_tcp_flags_all_zero(struct sk_buff *skb)
+{
+    struct tcphdr *th;
+
+    // 1. 基本安全检查
+    if (unlikely(!skb))
+        return 0;
+
+    // 2. 获取 TCP 头指针
+    // 注意：假设此时 skb 的 transport_header 已经正确指向 TCP 头
+    th = tcp_hdr(skb);
+
+    // 3. 检查 6 个经典标志位
+    // 我们忽略 ECE 和 CWR，因为它们属于 ECN 显式拥塞通知，不属于你要求的 6 个标志
+    if (th->fin == 0 && 
+        th->syn == 0 && 
+        th->rst == 0 && 
+        th->psh == 0 && 
+        th->ack == 0 && 
+        th->urg == 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int is_fast_signal(struct sk_buff *skb)
+{
+    struct tcphdr *th;
+    unsigned char *ptr;
+
+    if (unlikely(!skb))
+        return 0;
+
+    th = tcp_hdr(skb);
+    
+    // 定位到你发送端设置的相同偏移量：th + 20字节 + 12字节
+    ptr = (unsigned char *)(th + 1) + 12;
+
+    // 直接匹配 Kind(254) 和 ExID(0x1234)
+    if (ptr[0] == 254 && ptr[2] == 0x12 && ptr[3] == 0x34) {
+        return 1;
+    }
+
+    return 0;
+}
+
 
 static int
 br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
@@ -190,7 +240,7 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 	#if SENDER_FEATURE
 	if(skb_src_ip_match(skb, 0xC0A86403)) //192.168.100.3
 	{
-		if(skb_tcp_debug_handler(skb,SKB_TCP_CHECK_ACK,"TCP_DEBUG_HANDLER"))
+		if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_ACK, "TCP_DEBUG_HANDLER"))
 		{
 			skb_tcp_debug_handler(skb, SKB_TCP_PRINT_SEQ, "TCP_DEBUG_HANDLER");
 		}
@@ -202,33 +252,69 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 		struct cxl_skb_ring *ring = cxl_offset_mem_addr;	
 		static u32 current_tail;
 		static u8 prev_mark = 0;	
+		static u8 connection_status = CONNECTION_CLOSED; // 0: connection closed 1:half connected 2: full connected
 
 		//TODO:use a better method find the flow we need 
 		if(skb_src_ip_match(skb,0xC0A86402)) //192.168.100.2
 		{
 			//deinit connection
-			if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_FIN,"TCP_DEBUG_HANDLER"))
-			{
-				prev_mark = 0;
-				ring->tail = 0;
-				current_tail = 0;
-				clflush(ring);
-				__wmb();
-				goto original_path;
-			}
+			// if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_FIN, "TCP_DEBUG_HANDLER"))
+			// {
+			// 	prev_mark = 0;
+			// 	ring->tail = 0;
+			// 	current_tail = 0;
+			// 	clflush(ring);
+			// 	__wmb();
+			// 	// pr_info("find FIN pkt\n");
+			// 	goto original_path;
+			// }
 			
-			clflush(ring);
-			__rmb();
-			if(!ring->init_mark)
+			if(connection_status == CONNECTION_CLOSED)
 			{
+				pr_info("connection status:%u\n",connection_status);
+
+				if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_SYN, "br_netif_receive_skb"))
+				{
+					connection_status = CONNECTION_HALF_OPEN;
+					pr_info("connection status:%u\n", connection_status);
+				}
 				goto original_path;
 			}
-			else if(prev_mark == 0)
+			if(connection_status == CONNECTION_HALF_OPEN)
 			{
-				current_tail = 0;
-				prev_mark = 1;
+				if(is_fast_signal(skb))	
+				{
+					connection_status = CONNECTION_OPEN; 
+					current_tail = 0;
+					pr_info("connection status:%u\n", connection_status);
+				}
+				else
+					goto original_path;
 			}
-			if(skb_headlen(skb) >= 80){
+			if(connection_status == CONNECTION_OPEN)
+			{
+				if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_FIN, "br_netif_receive_skb"))
+				{
+					connection_status = CONNECTION_CLOSED;
+					prev_mark = 0;
+					goto original_path;
+				}
+			}
+
+			// clflush(ring);
+			// __rmb();
+			// if(!ring->init_mark)
+			// {
+			// 	goto original_path;
+			// }
+			// else if(prev_mark == 0)
+			// {
+			// 	current_tail = 0;
+			// 	prev_mark = 1;
+			// }
+			// if(skb_headlen(skb) >= 80){
+			// if(is_tcp_flags_all_zero(skb)){
+			if(is_fast_signal(skb)){
 
 				u32 budget = 0;
 				struct cxl_skb_entry entry;

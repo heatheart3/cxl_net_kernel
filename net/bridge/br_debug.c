@@ -90,14 +90,20 @@ bool skb_tcp_debug_handler(struct sk_buff *skb,
         pr_info("[%s] TCP Seq: %u, Ack-Seq: %u\n",
                 msg ? msg : "skb",
                 seq, ack_seq);
+                
         return false;
     }
 
     case SKB_TCP_CHECK_FIN:
         return !!th->fin;
+    
+    case SKB_TCP_CHECK_SYN:
+        return !!th->syn;
 
     case SKB_TCP_CHECK_ACK:
         return !!th->ack;
+    
+        
     }
 
     return false;

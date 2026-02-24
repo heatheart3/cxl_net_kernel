@@ -22,8 +22,20 @@
 #include <linux/numa.h>
 #include <linux/sched.h>
 #include <linux/topology.h>
+#include <linux/hrtimer.h>
+#include <linux/ktime.h>
+#include <linux/atomic.h>
+#include <linux/interrupt.h>
+#include <linux/skbuff.h>
 
 #include "br_private.h"
+
+
+struct hrtimer budget_hrtimer;
+struct tasklet_struct tx_flush_tasklet;
+atomic_t budget_timeout_fired = ATOMIC_INIT(0);
+extern struct sk_buff* intr_skb_template;
+
 
 /*
  * Handle changes in state of network devices enslaved to a bridge.
@@ -460,9 +472,13 @@ static int __init br_init(void)
 	}
 	#if SENDER_FEATURE
 		cxl_sender_mem_init();
+		tasklet_init(&tx_flush_tasklet, tx_flush_tasklet_func, 0);
+		hrtimer_init(&budget_hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+		budget_hrtimer.function = budget_timer_cb;
 	#elif RECV_FEATURE
 		cxl_recv_mem_init();
 	#endif
+
 
 	err = br_fdb_init();
 	if (err)
@@ -527,11 +543,14 @@ static void __exit br_deinit(void)
 {
 	#if SENDER_FEATURE
 		cxl_sender_mem_deinit();		
+		tasklet_kill(&tx_flush_tasklet);
+		hrtimer_cancel(&budget_hrtimer);
+		kfree_skb(intr_skb_template);
 	#elif RECV_FEATURE
 		cxl_recv_mem_deinit();
 	#endif
 
-	
+
 	stp_proto_unregister(&br_stp_proto);
 	br_netlink_fini();
 	unregister_switchdev_blocking_notifier(&br_switchdev_blocking_notifier);

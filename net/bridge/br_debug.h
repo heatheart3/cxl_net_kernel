@@ -11,6 +11,7 @@ enum skb_tcp_debug_op {
     SKB_TCP_PRINT_SEQ,
     SKB_TCP_CHECK_FIN,
     SKB_TCP_CHECK_ACK,
+    SKB_TCP_CHECK_SYN
 };
 
 enum skb_debug_op {
