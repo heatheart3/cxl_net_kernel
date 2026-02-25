@@ -36,6 +36,7 @@ static u64 cxl_base_phys = 0xb90000000;
 
 static u8 timer_counter;
 
+
 extern struct hrtimer budget_hrtimer;
 extern struct tasklet_struct tx_flush_tasklet;
 
@@ -302,7 +303,7 @@ static void ring_push(struct cxl_skb_ring* ring, u32* head, struct sk_buff* skb,
 
 	*head = ((*head) + 1) % RING_SIZE;
 
-	cxl_log_tx_enqueue(skb, "enqueue", ring, *head, entry_in->header.with_payload,queue_id);
+	// cxl_log_tx_enqueue(skb, "enqueue", ring, *head, entry_in->header.with_payload,queue_id);
 }
 
 static int update_intr_skb_template(struct sk_buff *skb, struct sk_buff **intr_skb_template)
@@ -410,15 +411,15 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 
 		if(ring_sender->c_status == CONNECTION_CLOSED)
 		{
-			pr_info("s_r_s:%u connection status:%u\n",ring_sender->src, ring_sender->c_status);
+			// pr_info("s_r_s:%u connection status:%u\n",ring_sender->src, ring_sender->c_status);
 
 			if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_SYN, "br_dev_queue_push_xmit"))
 			{
 				ring_sender->c_status = CONNECTION_HALF_OPEN;  // half connected
 				//TODO: there is a mem leak because intr_skb hasn't a method to release when unmount the module
 				int ret = update_intr_skb_template(skb, &ring_sender->intr_skb_template);
-				pr_info("ret %d\n", ret);
-				pr_info("s_r_s:%u, connection status:%u\n",ring_sender->src, ring_sender->c_status);
+				// pr_info("ret %d\n", ret);
+				// pr_info("s_r_s:%u, connection status:%u\n",ring_sender->src, ring_sender->c_status);
 			}
 			goto original_path;
 		}
@@ -427,7 +428,7 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 			if(cxl_fastpath_eligible(skb))
 			{
 				ring_sender->c_status = CONNECTION_OPEN;
-				pr_info("s_r_s:%u, connection status:%u\n",ring_sender->src,ring_sender->c_status);
+				// pr_info("s_r_s:%u, connection status:%u\n",ring_sender->src,ring_sender->c_status);
 				ring_sender->ring = cxl_ring_get_by_dst(skb);
 				ring_init(ring_sender->ring);
 				ring_sender->current_head = 0;
@@ -444,7 +445,7 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 				if(ring_sender->intr_skb_template)
 					kfree_skb(ring_sender->intr_skb_template);
 				ring_deinit(ring_sender->ring);
-				pr_info("s_r_s:%u, connection status:%u\n",ring_sender->src, ring_sender->c_status);
+				// pr_info("s_r_s:%u, connection status:%u\n",ring_sender->src, ring_sender->c_status);
 				goto original_path;
 			}
 		}
@@ -454,16 +455,12 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 
 		if(ring_sender->c_status == CONNECTION_OPEN){
 			if (cxl_fastpath_eligible(skb)) {
+				
 				clflush(ring_sender->ring);
 				__rmb();
-				// if(intr_skb_init == 0)
-				// {
-				// 	update_intr_skb_template(skb);
-				// 	intr_skb_init = 1;
-				// }
 				if (ring_sender->send_budget == 0 ) {
 					ring_sender->send_budget = get_ring_budget(ring_sender->ring, &ring_sender->current_head);
-					ring_sender->send_budget = (ring_sender->send_budget > 2) ? 2 : ring_sender->send_budget;
+					ring_sender->send_budget = (ring_sender->send_budget > 4) ? 4 : ring_sender->send_budget;
 					if(!ring_sender->intr_skb_template)
 						pr_info("NULL intr_skb\n");
 					send_intr_skb(ring_sender->intr_skb_template);
@@ -477,10 +474,10 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 					ring_sender->send_budget--;
 					// skb_debug_dump(skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
 					ring_push(ring_sender->ring, &ring_sender->current_head, skb, ring_sender->src);
-					__wmb();	
+					__wmb();
 					clflush(ring_sender->ring);
 					__rmb();
-					pr_info("current_head %u, head in ring: %u\n", ring_sender->current_head, ring_sender->ring->head);
+					// pr_info("current_head %u, head in ring: %u\n", ring_sender->current_head, ring_sender->ring->head);
 					// print_skb_refcounts(skb, "bridge");
 					// skb_debug_dump(skb,SKB_METADATA_LAYOUT, "SKB_DEBUG_DUMP");
 					// skb_tcp_debug_handler(skb, SKB_TCP_PRINT_SEQ, "SKB_TCP_DEBUG_HANDLER");

@@ -34,11 +34,21 @@ extern void* cxl_numa_mem_addr;
 
 void skb_adjust(struct sk_buff* skb)
 {
-    skb->ip_summed = CHECKSUM_UNNECESSARY; 
+	struct iphdr *iph;
+
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
 	skb_reset_mac_header(skb);
 	skb->mac_header -= 14;
 	skb_set_network_header(skb, 0);
-	skb_set_transport_header(skb, 20);
+	if (pskb_may_pull(skb, sizeof(struct iphdr))) {
+		iph = ip_hdr(skb);
+		if (iph && iph->version == 4)
+			skb_set_transport_header(skb, iph->ihl * 4);
+		else
+			skb_set_transport_header(skb, 20);
+	} else {
+		skb_set_transport_header(skb, 20);
+	}
 }
 
 static bool cxl_tcp_parse_rx(struct sk_buff *skb, struct tcphdr **th_out, u8 q_id)
@@ -130,6 +140,9 @@ void replace_skb_with_cxl_page(struct sk_buff *skb, int cxl_pfn,
     struct page *cxl_page;
     skb_frag_t *frag;
     struct skb_shared_info *shinfo = skb_shinfo(skb);
+	unsigned int old_data_len = skb->data_len;
+	unsigned int head_len = skb_headlen(skb);
+	int i;
 
     // 1. 获取 CXL 对应的 struct page
 	
@@ -141,18 +154,20 @@ void replace_skb_with_cxl_page(struct sk_buff *skb, int cxl_pfn,
     // 假设该页面是静态预留的，将其引用计数设为 1024
     // 这样即便经过多次 put_page，计数也不会归零
     // set_page_count(cxl_page, 1024);
-	SetPageReserved(cxl_page);
-
+	// if (!get_page_unless_zero(cxl_page))
+	// 	return;
 	if( page_count(cxl_page) <= 10)
 		get_page(cxl_page);
-
 	// pr_info("[replace_skb_page]: CXL Page PFN: 0x%lx, RefCount After: %d\n", 
     //     page_to_pfn(cxl_page), page_count(cxl_page));
     // 3. 释放 skb 现有的所有非线性区 frags（防止内存泄漏）
+	for (i = 0; i < shinfo->nr_frags; i++) {
+		frag = &shinfo->frags[i];
+		if (skb_frag_page(frag))
+			put_page(skb_frag_page(frag));
+	}
+
 	frag = &shinfo->frags[0];
-	/**** bug ****/
-    // if (skb_frag_page(frag))
-    //     put_page(skb_frag_page(frag));
 
 	// 4. 替换为 CXL 页面
     // TODO: implement function for pkts with multiple pages
@@ -161,21 +176,19 @@ void replace_skb_with_cxl_page(struct sk_buff *skb, int cxl_pfn,
     frag->bv_page = cxl_page;       
     frag->bv_offset = data_offset;
     frag->bv_len = data_len; 
-	pr_info("[replace_skb_with_cxl_page]offset:%u\n",frag->bv_offset);
+	// pr_info("[replace_skb_with_cxl_page]offset:%u\n",frag->bv_offset);
     // 5. 更新 shinfo 的分片计数
     shinfo->nr_frags = 1;
 
     // 6. 关键：更新 skb 的长度字段
-    // 减去旧的 data_len，加上新的 data_len
-    unsigned int old_data_len = skb->data_len;
     skb->data_len = data_len;
-    skb->len = skb->data_len + 52;
-
+    skb->len = 52 + skb->data_len;
+	// pr_info("head_len:%u\n");
     // // 7. 更新 truesize (可选，取决于你是否需要精确计费)
     // // CXL 内存不占用系统内存配额，但为了防止内核报警，可以设置一个合理值
     skb->truesize = skb->truesize - old_data_len + data_len;
 
-    // // // 8. 标记该 skb 的数据已被修改（如果是转发，可能需要重新计算 checksum）
+    // 8. 标记该 skb 的数据已被修改（如果是转发，可能需要重新计算 checksum）
 
 	// dump_skb_non_linear_data(skb);
 	// skb_debug_dump(skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
@@ -189,15 +202,14 @@ void copy_skb_whole_linear_with_shinfo(struct sk_buff *skb, struct cxl_skb_entry
         return;
 	// pr_info("COPY:data addr:0x%llx\n", skb->data);
 
-    memcpy(skb->data, entry->header.content, entry->header.size);
+	memcpy(skb->data, entry->header.content, entry->header.size);
 	// pr_info("[replace test]:size:%u ",entry->header.size);
 	
 	// 恢复布局的相对位置
     // skb->data = skb->head + old_data_off;
 	skb_reset_tail_pointer(skb);
-	
-	skb_put(skb, 66);
-	skb_pull(skb, 14);
+	skb_put(skb, entry->header.size);
+	skb_pull(skb, ETH_HLEN);
 
 }
 
@@ -209,6 +221,7 @@ static void ring_init(struct cxl_skb_ring * ring)
 	ring->ring_size = RING_SIZE;
 	clflush(ring);
 }
+
 static u32 get_ring_budget(struct cxl_skb_ring* ring, u32* current_tail)
 {
 	
@@ -241,18 +254,15 @@ void ring_pop(struct cxl_skb_ring* ring, u32* current_tail, struct sk_buff* skb,
 	copy_skb_whole_linear_with_shinfo(skb, entry_in);
 	//TODO:maybe for the control pkts, this part should optimize to erease the page for payload
 	if(entry_in->header.with_payload == 1)
+	{
 		replace_skb_with_cxl_page(skb, entry_in->payload.pfn, entry_in->payload.offset, entry_in->payload.size);
+	}
 	
 	skb_adjust(skb);
 
 	
-	// if(q_id == 3)
-	// {
-	// 	skb_debug_dump(skb, SKB_METADATA_LAYOUT, "ring_pop");
-	// }
-	
-	cxl_log_rx_dequeue(skb, ring, old_tail, entry_in->header.with_payload,
-			   entry_in->header.size, entry_in->payload.size,q_id);
+	// cxl_log_rx_dequeue(skb, ring, old_tail, entry_in->header.with_payload,
+	// 		   entry_in->header.size, entry_in->payload.size,q_id);
 
 	*current_tail = ((*current_tail)+1) % RING_SIZE;
 
@@ -358,13 +368,13 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 	br_drop_fake_rtable(skb);
 
 	#if SENDER_FEATURE
-	if(skb_src_ip_match(skb, 0xC0A86403)) //192.168.100.3
-	{
-		if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_ACK, "TCP_DEBUG_HANDLER"))
-		{
-			skb_tcp_debug_handler(skb, SKB_TCP_PRINT_SEQ, "TCP_DEBUG_HANDLER");
-		}
-	}
+	// if(skb_src_ip_match(skb, 0xC0A86403)) //192.168.100.3
+	// {
+	// 	if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_ACK, "TCP_DEBUG_HANDLER"))
+	// 	{
+	// 		skb_tcp_debug_handler(skb, SKB_TCP_PRINT_SEQ, "TCP_DEBUG_HANDLER");
+	// 	}
+	// }
 	#endif
 
 	#if RECV_FEATURE
@@ -375,12 +385,12 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 
 			if(recver->c_status == CONNECTION_CLOSED)
 			{
-				pr_info("r_r_s:%u connection status:%u\n",recver->src,recver->c_status);
+				// pr_info("r_r_s:%u connection status:%u\n",recver->src,recver->c_status);
 
 				if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_SYN, "br_netif_receive_skb"))
 				{
 					recver->c_status = CONNECTION_HALF_OPEN;
-					pr_info("r_r_s:%u connection status:%u\n",recver->src, recver->c_status);
+					// pr_info("r_r_s:%u connection status:%u\n",recver->src, recver->c_status);
 				}
 				goto original_path;
 			}
@@ -411,31 +421,15 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 			if (!ring)
 				goto original_path;
 
-			// clflush(ring);
-			// __rmb();
-			// if(!ring->init_mark)
-			// {
-			// 	goto original_path;
-			// }
-			// else if(prev_mark == 0)
-			// {
-			// 	current_tail = 0;
-			// 	prev_mark = 1;
-			// }
 			// if(skb_headlen(skb) >= 80){
 			// if(is_tcp_flags_all_zero(skb)){
 			if(is_fast_signal(skb)){
-
+				
 				recver->recv_budget = 0;
 				
-				
 				//get budget for this poll
-				if(recver->src == 3)
-				{
-					pr_info("r_r_s 3: head:%u tail:%u\n", ring->head,ring->tail);
-				}
 				recver->recv_budget = get_ring_budget(ring, &recver->current_tail);
-				recver->recv_budget = (recver->recv_budget > 4) ? 4 : recver->recv_budget;
+				recver->recv_budget = (recver->recv_budget > 32) ? 32 : recver->recv_budget;
 				
 				if(recver->recv_budget == 0)
 				{
@@ -448,10 +442,6 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 				struct sk_buff* new_skb;
 				while(recver->recv_budget)
 				{
-					if(recver->src == 3)
-					{
-						pr_info("r_r_s 3: budget:%u\n", recver->recv_budget);
-					}
 					new_skb = alloc_skb(linear_size, GFP_KERNEL);
 					skb_configure(new_skb, skb);
 					// pr_info("[br_netif_recv]:budget:%u,tail:%u, header size:%u \n",budget,current_tail,ring->buf[current_tail].header.size);
