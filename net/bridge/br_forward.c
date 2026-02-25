@@ -39,9 +39,129 @@ static u8 timer_counter;
 extern struct hrtimer budget_hrtimer;
 extern struct tasklet_struct tx_flush_tasklet;
 
-struct sk_buff* intr_skb_template;
+// struct sk_buff* intr_skb_template;
 
 struct cxl_ring_sender ring2to3, ring3to2;
+static bool cxl_tcp_parse(struct sk_buff *skb, struct tcphdr **th_out);
+
+static const char *cxl_tcp_type(struct tcphdr *th, u16 payload_len)
+{
+	if (th->syn && th->ack)
+		return "SYN-ACK";
+	if (th->syn)
+		return "SYN";
+	if (th->fin && th->ack)
+		return "FIN-ACK";
+	if (th->fin)
+		return "FIN";
+	if (th->rst)
+		return "RST";
+	if (th->ack && payload_len == 0 && !th->psh)
+		return "ACK-ONLY";
+	if (payload_len > 0)
+		return "DATA";
+
+	return "OTHER";
+}
+
+static void cxl_log_tx_enqueue(struct sk_buff *skb, const char *tag,
+			       struct cxl_skb_ring *ring, u32 head,
+			       bool with_payload, u8 queue_id)
+{
+	struct tcphdr *th;
+	struct iphdr *iph;
+	u16 ip_len, tcph_len, payload_len;
+
+	if (!cxl_tcp_parse(skb, &th))
+		return;
+
+	iph = ip_hdr(skb);
+	if (!iph)
+		return;
+
+	ip_len = ntohs(iph->tot_len);
+	tcph_len = th->doff * 4;
+	payload_len = (ip_len > iph->ihl * 4 + tcph_len) ?
+		      (ip_len - iph->ihl * 4 - tcph_len) : 0;
+
+	pr_info("[cxl-tx:%s] q_id:%u type=%s %pI4:%u -> %pI4:%u datalen:%u seq=%u ack=%u payload=%u with_payload=%u head=%u tail=%u\n",
+		tag,queue_id, cxl_tcp_type(th, payload_len),
+		&iph->saddr, ntohs(th->source), &iph->daddr, ntohs(th->dest),skb_headlen(skb),
+		ntohl(th->seq), ntohl(th->ack_seq), payload_len, with_payload,
+		head, ring->tail);
+}
+
+static bool cxl_flow_ip_match(struct sk_buff *skb)
+{
+	bool d2 = skb_dst_ip_match(skb, 0xC0A86402); /* 192.168.100.2 */
+	bool d3 = skb_dst_ip_match(skb, 0xC0A86403); /* 192.168.100.3 */
+	bool s2 = skb_src_ip_match(skb, 0xC0A86402);
+	bool s3 = skb_src_ip_match(skb, 0xC0A86403);
+
+	return (s2 && d3) || (s3 && d2);
+}
+
+static bool cxl_tcp_parse(struct sk_buff *skb, struct tcphdr **th_out)
+{
+	struct iphdr *iph;
+	struct tcphdr *th;
+	unsigned int ihl_bytes;
+
+	if (!skb || skb->protocol != htons(ETH_P_IP))
+		return false;
+	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+		return false;
+
+	iph = ip_hdr(skb);
+	if (!iph || iph->version != 4 || iph->protocol != IPPROTO_TCP)
+		return false;
+
+	ihl_bytes = iph->ihl * 4;
+	if (!pskb_may_pull(skb, ihl_bytes + sizeof(struct tcphdr)))
+		return false;
+
+	iph = ip_hdr(skb);
+	th = (struct tcphdr *)((u8 *)iph + ihl_bytes);
+	if (th_out)
+		*th_out = th;
+	return true;
+}
+
+static bool cxl_tcp_teardown(struct sk_buff *skb)
+{
+	struct tcphdr *th;
+
+	if (!cxl_tcp_parse(skb, &th))
+		return false;
+
+	return th->fin;
+}
+
+static bool cxl_fastpath_eligible(struct sk_buff *skb)
+{
+	struct tcphdr *th;
+
+	if (!cxl_flow_ip_match(skb))
+		return false;
+	if (!cxl_tcp_parse(skb, &th))
+		return false;
+
+	/* Keep 3-way handshake and 4-way teardown on normal NIC path. */
+	if (th->syn || th->fin || th->rst)
+		return false;
+
+	return true;
+}
+
+static struct cxl_skb_ring *cxl_ring_get_by_dst(struct sk_buff *skb)
+{
+	struct cxl_skb_ring *ring_base = (struct cxl_skb_ring *)cxl_offset_mem_addr;
+
+	if (skb_dst_ip_match(skb, 0xC0A86403)) /* 192.168.100.3 */
+		return &ring_base[0];
+
+	return &ring_base[1];
+}
 
 
 
@@ -52,10 +172,13 @@ static inline void budget_timer_start(void)
 }
 
 
-void send_intr_skb(void)
+void send_intr_skb(struct sk_buff* intr_skb_template)
 {
 	struct sk_buff *skb_to_send;
 	unsigned long flags;
+
+	if (!intr_skb_template)
+		return;
 
 	skb_to_send = skb_copy(intr_skb_template, GFP_ATOMIC);
 
@@ -69,7 +192,7 @@ void send_intr_skb(void)
 
 void tx_flush_tasklet_func(unsigned long data)
 {
-	send_intr_skb();
+	// send_intr_skb();
 }
 
 enum hrtimer_restart budget_timer_cb(struct hrtimer *t)
@@ -151,7 +274,7 @@ static int get_ring_budget(struct cxl_skb_ring* ring, u32* current_head)
 
 
 
-static void ring_push(struct cxl_skb_ring* ring, struct cxl_skb_entry* entry, u32* head, struct sk_buff* skb)
+static void ring_push(struct cxl_skb_ring* ring, u32* head, struct sk_buff* skb, u8 queue_id)
 {
 	/*** TODO: current design can't support that there are many CPUs use this ring to push 
 		 because maybe two CPUs read the same head 
@@ -178,18 +301,34 @@ static void ring_push(struct cxl_skb_ring* ring, struct cxl_skb_entry* entry, u3
 	// pr_info("[ring_push] head:%u buffer size%u\n",*head,entry_in->header.size);
 
 	*head = ((*head) + 1) % RING_SIZE;
+
+	cxl_log_tx_enqueue(skb, "enqueue", ring, *head, entry_in->header.with_payload,queue_id);
 }
 
-static int update_intr_skb_template(struct sk_buff *skb)
+static int update_intr_skb_template(struct sk_buff *skb, struct sk_buff **intr_skb_template)
 {
-
-	intr_skb_template = skb_copy(skb, GFP_ATOMIC);
-	if (!intr_skb_template)
-		return -ENOMEM;
+	struct sk_buff *tmpl;
 	struct tcphdr* th;
 	struct iphdr* iph;
-	th = tcp_hdr(intr_skb_template);
-    iph = ip_hdr(intr_skb_template);
+	unsigned char* ptr;
+
+	
+	if(!skb)
+	{
+		pr_info("source is null\n");
+		return -ENOMEM;
+	}
+	if (!intr_skb_template)
+		return -EINVAL;
+
+	tmpl = skb_copy(skb, GFP_ATOMIC);
+	if (!tmpl)
+	{
+		pr_info("fail to copy\n");
+		return -ENOMEM;
+	}
+	th = tcp_hdr(tmpl);
+    iph = ip_hdr(tmpl);
 
     // 3. 将六个经典标志位全部置为 0
     // 这包括：FIN, SYN, RST, PSH, ACK, URG
@@ -201,8 +340,9 @@ static int update_intr_skb_template(struct sk_buff *skb)
     th->ack = 0;
     th->urg = 0;
 
-	unsigned char* ptr = (unsigned char *)(th + 1);
-	th->doff += 2;
+	ptr = (unsigned char *)(th + 1);
+	if (th->doff <= 13)
+		th->doff += 2;
 	ptr = ptr + 12;
     // 4. 填充 RFC 6994 格式内容
     ptr[0] = 254;        // Kind: Experimental
@@ -213,7 +353,10 @@ static int update_intr_skb_template(struct sk_buff *skb)
     ptr[5] = 0xBB;       // 你的自定义实验数据 2
     ptr[6] = 0xCC;       // 你的自定义实验数据 3
     ptr[7] = 0xDD;       // 你的自定义实验数据 4
-	
+		
+	if (*intr_skb_template)
+		kfree_skb(*intr_skb_template);
+	*intr_skb_template = tmpl;
 
 	return 0;
 }
@@ -249,115 +392,95 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 
 	br_switchdev_frame_set_offload_fwd_mark(skb);
 	#if SENDER_FEATURE    
-	static u32 budget = 0;
-	static u32 head;
-	static u32 init_mark = 0;
-	static u8 connection_status = 0; // 0: connection closed 1:half connected 2: full connected
-	static u8 intr_skb_init = 0;
-	struct cxl_skb_entry entry;
-	struct cxl_skb_ring* ring;
-	struct cxl_ring_sender* ring_sender;
-	// if(skb_dst_ip_match(skb, 0xC0A86403))
-	// {
-	// 	ring_sender = ring2to3;
-	// }
-	// else{
-	// 	ring_sender = ring3to2;
-	// }
-	
-	if(skb_dst_ip_match(skb, 0xC0A86403))
-	{	
 
-		if(connection_status == CONNECTION_CLOSED)
+
+	if (cxl_flow_ip_match(skb))
+	{	
+		struct cxl_ring_sender* ring_sender;
+
+		if(skb_dst_ip_match(skb, 0xC0A86403))
 		{
-			pr_info("connection status:%u\n",connection_status);
+			ring_sender = &ring2to3;
+			ring_sender->src = 2;
+		}
+		else{
+			ring_sender = &ring3to2;
+			ring_sender->src = 3;
+		}
+
+		if(ring_sender->c_status == CONNECTION_CLOSED)
+		{
+			pr_info("s_r_s:%u connection status:%u\n",ring_sender->src, ring_sender->c_status);
 
 			if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_SYN, "br_dev_queue_push_xmit"))
 			{
-				connection_status = CONNECTION_HALF_OPEN;  // half connected
-				pr_info("connection status:%u\n",connection_status);
+				ring_sender->c_status = CONNECTION_HALF_OPEN;  // half connected
+				//TODO: there is a mem leak because intr_skb hasn't a method to release when unmount the module
+				int ret = update_intr_skb_template(skb, &ring_sender->intr_skb_template);
+				pr_info("ret %d\n", ret);
+				pr_info("s_r_s:%u, connection status:%u\n",ring_sender->src, ring_sender->c_status);
 			}
 			goto original_path;
 		}
-		if(connection_status == CONNECTION_HALF_OPEN)
+		if(ring_sender->c_status == CONNECTION_HALF_OPEN)
 		{
-			if(skb_is_nonlinear(skb))
+			if(cxl_fastpath_eligible(skb))
 			{
-				connection_status = CONNECTION_OPEN;
-				pr_info("connection status:%u\n",connection_status);
-				ring_init(ring);
-				budget = 0;
-				head = 0;
+				ring_sender->c_status = CONNECTION_OPEN;
+				pr_info("s_r_s:%u, connection status:%u\n",ring_sender->src,ring_sender->c_status);
+				ring_sender->ring = cxl_ring_get_by_dst(skb);
+				ring_init(ring_sender->ring);
+				ring_sender->current_head = 0;
+				ring_sender->send_budget = 0;
 			}
 			else 
 				goto original_path;
 		}
-		if(connection_status == CONNECTION_OPEN)
+		if(ring_sender->c_status == CONNECTION_OPEN)
 		{
-			if(skb_tcp_debug_handler(skb,SKB_TCP_CHECK_FIN,"br_dev_queue_push_xmit"))
+			if(cxl_tcp_teardown(skb))
 			{
-				connection_status = CONNECTION_CLOSED;
-				ring_deinit(ring);
-				pr_info("connection status:%u\n",connection_status);
+				ring_sender->c_status = CONNECTION_CLOSED;
+				if(ring_sender->intr_skb_template)
+					kfree_skb(ring_sender->intr_skb_template);
+				ring_deinit(ring_sender->ring);
+				pr_info("s_r_s:%u, connection status:%u\n",ring_sender->src, ring_sender->c_status);
 				goto original_path;
 			}
 		}
-		if(connection_status == CONNECTION_CLOSED)
+
+		if(ring_sender->c_status == CONNECTION_CLOSED)
 			goto original_path;
 
-		
-		if(connection_status == CONNECTION_OPEN){
-			if (skb_is_nonlinear(skb)) {
-			// if(0){
-				clflush(ring);
+		if(ring_sender->c_status == CONNECTION_OPEN){
+			if (cxl_fastpath_eligible(skb)) {
+				clflush(ring_sender->ring);
 				__rmb();
-				// if(init_mark == 0)
+				// if(intr_skb_init == 0)
 				// {
-				// 	ring_init(ring);
-				// 	init_mark = 1;
-				// 	head = 0;
+				// 	update_intr_skb_template(skb);
+				// 	intr_skb_init = 1;
 				// }
-				if(intr_skb_init == 0)
-				{
-					update_intr_skb_template(skb);
-					intr_skb_init = 1;
-				}
-				// if(budget == 0)
-				// {
-				// 	budget = get_ring_budget(ring, &head);
-				// 	budget = (budget > 4) ? 4 : budget;
-				// 	// pr_info("[INTR sent]");
-				// 	// pr_info("budget:%u\n", budget);
-				// 	goto original_path;
-				// }
-
-				if (budget == 0 ) {
-					budget = get_ring_budget(ring, &head);
-					budget = (budget > 4) ? 4 : budget;
-					send_intr_skb();
+				if (ring_sender->send_budget == 0 ) {
+					ring_sender->send_budget = get_ring_budget(ring_sender->ring, &ring_sender->current_head);
+					ring_sender->send_budget = (ring_sender->send_budget > 2) ? 2 : ring_sender->send_budget;
+					if(!ring_sender->intr_skb_template)
+						pr_info("NULL intr_skb\n");
+					send_intr_skb(ring_sender->intr_skb_template);
 					// hrtimer_cancel(&budget_hrtimer);
 					// timer_counter = 0;
 					// budget_timer_start();
 				}
 
-				// if(budget == 1 || budget_timer_expired_consume())
-				// {
-				// 	/* 重新开始 20us 计时窗口（下一次超时就再触发） */
-				// 	budget_timer_start();
-				// 	budget --;
-				// 	goto original_path;
-				// }
-
-				if(budget--)
+				if (ring_sender->send_budget > 0)
 				{
-					// dump_skb_frags(skb, &entry);
-
-					skb_debug_dump(skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
-					ring_push(ring, &entry, &head,skb);
+					ring_sender->send_budget--;
+					// skb_debug_dump(skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
+					ring_push(ring_sender->ring, &ring_sender->current_head, skb, ring_sender->src);
 					__wmb();	
-					clflush(ring);
+					clflush(ring_sender->ring);
 					__rmb();
-					pr_info("current_head %u, head in ring: %u\n", head, ring->head);
+					pr_info("current_head %u, head in ring: %u\n", ring_sender->current_head, ring_sender->ring->head);
 					// print_skb_refcounts(skb, "bridge");
 					// skb_debug_dump(skb,SKB_METADATA_LAYOUT, "SKB_DEBUG_DUMP");
 					// skb_tcp_debug_handler(skb, SKB_TCP_PRINT_SEQ, "SKB_TCP_DEBUG_HANDLER");
@@ -667,4 +790,3 @@ out:
 		kfree_skb(skb);
 }
 #endif
-

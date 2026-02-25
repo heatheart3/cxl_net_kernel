@@ -31,6 +31,90 @@ extern void* cxl_offset_mem_addr;
 extern void* cxl_numa_mem_addr;
 
 
+
+void skb_adjust(struct sk_buff* skb)
+{
+    skb->ip_summed = CHECKSUM_UNNECESSARY; 
+	skb_reset_mac_header(skb);
+	skb->mac_header -= 14;
+	skb_set_network_header(skb, 0);
+	skb_set_transport_header(skb, 20);
+}
+
+static bool cxl_tcp_parse_rx(struct sk_buff *skb, struct tcphdr **th_out, u8 q_id)
+{
+	struct iphdr *iph;
+	struct tcphdr *th;
+	unsigned int ihl_bytes;
+
+	if (!skb || skb->protocol != htons(ETH_P_IP))
+		return false;
+
+	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+		return false;
+	// can't pass
+	iph = ip_hdr(skb);
+	if (!iph || iph->version != 4 || iph->protocol != IPPROTO_TCP)
+		return false;
+	ihl_bytes = iph->ihl * 4;
+	if (!pskb_may_pull(skb, ihl_bytes + sizeof(struct tcphdr)))
+		return false;
+
+	iph = ip_hdr(skb);
+	th = (struct tcphdr *)((u8 *)iph + ihl_bytes);
+	if (th_out)
+		*th_out = th;
+
+	return true;
+}
+
+static const char *cxl_tcp_type_rx(struct tcphdr *th, u16 payload_len)
+{
+	if (th->syn && th->ack)
+		return "SYN-ACK";
+	if (th->syn)
+		return "SYN";
+	if (th->fin && th->ack)
+		return "FIN-ACK";
+	if (th->fin)
+		return "FIN";
+	if (th->rst)
+		return "RST";
+	if (th->ack && payload_len == 0 && !th->psh)
+		return "ACK-ONLY";
+	if (payload_len > 0)
+		return "DATA";
+
+	return "OTHER";
+}
+
+static void cxl_log_rx_dequeue(struct sk_buff *skb, struct cxl_skb_ring *ring, u32 tail,
+			       bool with_payload, u32 hdr_size, u32 payload_size, u8 q_id)
+{
+	struct tcphdr *th;
+	struct iphdr *iph;
+	u16 ip_len, tcph_len, payload_len;
+	
+	if (!cxl_tcp_parse_rx(skb, &th, q_id))
+		return;
+
+	iph = ip_hdr(skb);
+	if (!iph)
+		return;
+
+	ip_len = ntohs(iph->tot_len);
+	tcph_len = th->doff * 4;
+	payload_len = (ip_len > iph->ihl * 4 + tcph_len) ?
+		      (ip_len - iph->ihl * 4 - tcph_len) : 0;
+
+	pr_info("[cxl-rx:dequeue] q_id %u type=%s %pI4:%u -> %pI4:%u seq=%u ack=%u payload=%u with_payload=%u entry_hdr=%u entry_payload=%u tail=%u head=%u\n",
+		q_id,cxl_tcp_type_rx(th, payload_len),
+		&iph->saddr, ntohs(th->source), &iph->daddr, ntohs(th->dest),
+		ntohl(th->seq), ntohl(th->ack_seq), payload_len, with_payload,
+		hdr_size, payload_size, tail, ring->head);
+}
+
+
 /**
  * replace_skb_with_cxl_page - 用 CXL 物理页替换 skb 的非线性数据区
  * @skb: 需要修改的 socket buffer
@@ -41,7 +125,7 @@ extern void* cxl_numa_mem_addr;
  * 注意：调用者需确保 skb 有足够的空间或已被合理初始化
  */
 void replace_skb_with_cxl_page(struct sk_buff *skb, int cxl_pfn, 
-                               unsigned int data_offset, unsigned int data_len, unsigned int headlen)
+                               unsigned int data_offset, unsigned int data_len)
 {
     struct page *cxl_page;
     skb_frag_t *frag;
@@ -85,21 +169,16 @@ void replace_skb_with_cxl_page(struct sk_buff *skb, int cxl_pfn,
     // 减去旧的 data_len，加上新的 data_len
     unsigned int old_data_len = skb->data_len;
     skb->data_len = data_len;
-    skb->len = skb->data_len + headlen;
+    skb->len = skb->data_len + 52;
 
     // // 7. 更新 truesize (可选，取决于你是否需要精确计费)
     // // CXL 内存不占用系统内存配额，但为了防止内核报警，可以设置一个合理值
     skb->truesize = skb->truesize - old_data_len + data_len;
 
     // // // 8. 标记该 skb 的数据已被修改（如果是转发，可能需要重新计算 checksum）
-    skb->ip_summed = CHECKSUM_UNNECESSARY; 
-	skb_reset_mac_header(skb);
-	skb->mac_header -= 14;
-	skb_set_network_header(skb, 0);
-	skb_set_transport_header(skb, 20);
-	// dump_skb_non_linear_data(skb);
-	skb_debug_dump(skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
 
+	// dump_skb_non_linear_data(skb);
+	// skb_debug_dump(skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
 }
 
 
@@ -114,8 +193,6 @@ void copy_skb_whole_linear_with_shinfo(struct sk_buff *skb, struct cxl_skb_entry
 	// pr_info("[replace test]:size:%u ",entry->header.size);
 	
 	// 恢复布局的相对位置
-	/* 1. 恢复 data 和 tail 的相对位置 */
-    /* 这样能保证 data 依然在 78，tail 依然在 130 */
     // skb->data = skb->head + old_data_off;
 	skb_reset_tail_pointer(skb);
 	
@@ -151,8 +228,9 @@ static u32 get_ring_budget(struct cxl_skb_ring* ring, u32* current_tail)
 		return ring->ring_size - (*current_tail) + head;
 }
 
-void ring_pop(struct cxl_skb_ring* ring, struct cxl_skb_entry* recv_entry, u32* current_tail, struct sk_buff* skb)
+void ring_pop(struct cxl_skb_ring* ring, u32* current_tail, struct sk_buff* skb, u8 q_id)
 {
+	u32 old_tail = *current_tail;
 	void *p = &ring->buf[*current_tail];
 	clflush(p);
 	clflush(p+64);
@@ -160,15 +238,23 @@ void ring_pop(struct cxl_skb_ring* ring, struct cxl_skb_entry* recv_entry, u32* 
 
 	struct cxl_skb_entry* entry_in = &ring->buf[*current_tail];
 	__rmb();
-	// pr_info("[POP]tail:%u,offset:0x%lx,size:%u\n",*current_tail,ring->buf[*current_tail].header.offset, ring->buf[*current_tail].header.size);
-	// pr_info("[ring_pop]:tail:%u size:%u\n",*current_tail ,entry_in->header.size);
 	copy_skb_whole_linear_with_shinfo(skb, entry_in);
-	// pr_info("[ring_pop] payload_pfn:0x%llx, size:%u\n", entry_in->payload.pfn, entry_in->payload.size);
 	//TODO:maybe for the control pkts, this part should optimize to erease the page for payload
 	if(entry_in->header.with_payload == 1)
-		replace_skb_with_cxl_page(skb, entry_in->payload.pfn, entry_in->payload.offset, entry_in->payload.size, 52);
+		replace_skb_with_cxl_page(skb, entry_in->payload.pfn, entry_in->payload.offset, entry_in->payload.size);
+	
+	skb_adjust(skb);
 
-	*current_tail = ((*current_tail)+1)%RING_SIZE;
+	
+	// if(q_id == 3)
+	// {
+	// 	skb_debug_dump(skb, SKB_METADATA_LAYOUT, "ring_pop");
+	// }
+	
+	cxl_log_rx_dequeue(skb, ring, old_tail, entry_in->header.with_payload,
+			   entry_in->header.size, entry_in->payload.size,q_id);
+
+	*current_tail = ((*current_tail)+1) % RING_SIZE;
 
 }
 
@@ -231,6 +317,40 @@ static int is_fast_signal(struct sk_buff *skb)
     return 0;
 }
 
+static bool cxl_rx_flow_ip_match(struct sk_buff *skb)
+{
+	bool d2 = skb_dst_ip_match(skb, 0xC0A86402); /* 192.168.100.2 */
+	bool d3 = skb_dst_ip_match(skb, 0xC0A86403); /* 192.168.100.3 */
+	bool s2 = skb_src_ip_match(skb, 0xC0A86402);
+	bool s3 = skb_src_ip_match(skb, 0xC0A86403);
+
+	return (s2 && d3) || (s3 && d2);
+}
+
+static struct cxl_skb_ring *cxl_ring_get_by_flow_src(struct sk_buff *skb)
+{
+	struct cxl_skb_ring *ring_base = (struct cxl_skb_ring *)cxl_offset_mem_addr;
+
+	if (skb_src_ip_match(skb, 0xC0A86402)) /* 192.168.100.2 -> 192.168.100.3 */
+		return &ring_base[0];
+
+	return &ring_base[1]; /* 192.168.100.3 -> 192.168.100.2 */
+}
+
+static struct cxl_ring_recver *cxl_recver_get_by_flow_src(struct sk_buff *skb)
+{
+	static struct cxl_ring_recver recv2to3;
+	static struct cxl_ring_recver recv3to2;
+
+	if (skb_src_ip_match(skb, 0xC0A86402))
+	{
+		recv2to3.src = 2;
+		return &recv2to3;
+	}
+	recv3to2.src = 3;
+	return &recv3to2;
+}
+
 
 static int
 br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
@@ -248,58 +368,48 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 	#endif
 
 	#if RECV_FEATURE
-		// ip header + tcp header + mac header = 20 + 32 + 14 = 66. Here uses a conservative value 80 to ensure that it's a data pkt but not a control pkt
-		struct cxl_skb_ring *ring = cxl_offset_mem_addr;	
-		static u32 current_tail;
-		static u8 prev_mark = 0;	
-		static u8 connection_status = CONNECTION_CLOSED; // 0: connection closed 1:half connected 2: full connected
-
-		//TODO:use a better method find the flow we need 
-		if(skb_src_ip_match(skb,0xC0A86402)) //192.168.100.2
+		if (cxl_rx_flow_ip_match(skb))
 		{
-			//deinit connection
-			// if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_FIN, "TCP_DEBUG_HANDLER"))
-			// {
-			// 	prev_mark = 0;
-			// 	ring->tail = 0;
-			// 	current_tail = 0;
-			// 	clflush(ring);
-			// 	__wmb();
-			// 	// pr_info("find FIN pkt\n");
-			// 	goto original_path;
-			// }
-			
-			if(connection_status == CONNECTION_CLOSED)
+			struct cxl_ring_recver *recver = cxl_recver_get_by_flow_src(skb);
+			struct cxl_skb_ring *ring;
+
+			if(recver->c_status == CONNECTION_CLOSED)
 			{
-				pr_info("connection status:%u\n",connection_status);
+				pr_info("r_r_s:%u connection status:%u\n",recver->src,recver->c_status);
 
 				if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_SYN, "br_netif_receive_skb"))
 				{
-					connection_status = CONNECTION_HALF_OPEN;
-					pr_info("connection status:%u\n", connection_status);
+					recver->c_status = CONNECTION_HALF_OPEN;
+					pr_info("r_r_s:%u connection status:%u\n",recver->src, recver->c_status);
 				}
 				goto original_path;
 			}
-			if(connection_status == CONNECTION_HALF_OPEN)
+			if(recver->c_status == CONNECTION_HALF_OPEN)
 			{
 				if(is_fast_signal(skb))	
 				{
-					connection_status = CONNECTION_OPEN; 
-					current_tail = 0;
-					pr_info("connection status:%u\n", connection_status);
+					recver->c_status = CONNECTION_OPEN; 
+					recver->current_tail = 0;
+					recver->ring = cxl_ring_get_by_flow_src(skb);
+					ring = recver->ring;
+					// ring_init(ring);
+					pr_info("r_r_s:%u connection status:%u\n", recver->src, recver->c_status);
 				}
 				else
 					goto original_path;
 			}
-			if(connection_status == CONNECTION_OPEN)
+			if(recver->c_status == CONNECTION_OPEN)
 			{
 				if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_FIN, "br_netif_receive_skb"))
 				{
-					connection_status = CONNECTION_CLOSED;
-					prev_mark = 0;
+					recver->c_status = CONNECTION_CLOSED;
 					goto original_path;
 				}
 			}
+
+			ring = recver->ring;
+			if (!ring)
+				goto original_path;
 
 			// clflush(ring);
 			// __rmb();
@@ -316,38 +426,46 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
 			// if(is_tcp_flags_all_zero(skb)){
 			if(is_fast_signal(skb)){
 
-				u32 budget = 0;
-				struct cxl_skb_entry entry;
+				recver->recv_budget = 0;
+				
 				
 				//get budget for this poll
-				budget = get_ring_budget(ring, &current_tail);
-				budget = (budget > 4) ? 4 : budget;
-				if(budget == 0)
+				if(recver->src == 3)
 				{
-					pr_info("[br] no new message\n");
+					pr_info("r_r_s 3: head:%u tail:%u\n", ring->head,ring->tail);
+				}
+				recver->recv_budget = get_ring_budget(ring, &recver->current_tail);
+				recver->recv_budget = (recver->recv_budget > 4) ? 4 : recver->recv_budget;
+				
+				if(recver->recv_budget == 0)
+				{
+					pr_info("r_r_s:%u [br] no new message\n", recver->src);
 					goto drop;
 				}
 				// TODO: test skb clone by configure budget is 1
-
 				u32 linear_size = skb_end_pointer(skb) - skb->head;
 				// pr_info("[bridge_recv] linear size of skb %d\n", linear_size);
 				struct sk_buff* new_skb;
-				while(budget)
+				while(recver->recv_budget)
 				{
+					if(recver->src == 3)
+					{
+						pr_info("r_r_s 3: budget:%u\n", recver->recv_budget);
+					}
 					new_skb = alloc_skb(linear_size, GFP_KERNEL);
 					skb_configure(new_skb, skb);
 					// pr_info("[br_netif_recv]:budget:%u,tail:%u, header size:%u \n",budget,current_tail,ring->buf[current_tail].header.size);
-					ring_pop(ring, &entry, &current_tail, new_skb);
+					ring_pop(ring, &recver->current_tail, new_skb, recver->src);
 					// copy_skb_whole_linear_with_shinfo(new_skb, entry);
 					// content_test(entry.payload.pfn);
 					// replace_skb_with_cxl_page(new_skb, entry.payload.pfn, 0, entry.payload.size, entry.header.size - 14);
-					skb_debug_dump(new_skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
+					// skb_debug_dump(new_skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
 					// skb_metadata_compare(skb,new_skb);
-					skb_tcp_debug_handler(new_skb, SKB_TCP_PRINT_SEQ, "TCP_DEBUG_HANDLER");
+					// skb_tcp_debug_handler(new_skb, SKB_TCP_PRINT_SEQ, "TCP_DEBUG_HANDLER");
 					// kfree_skb(new_skb);
 					// goto original_path;
 					netif_receive_skb(new_skb);
-					budget --;
+					recver->recv_budget --;
 				}
 				//TODO: current solution can confirm the sequence of pkts or not?
 				goto drop;

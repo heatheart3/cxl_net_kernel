@@ -34,7 +34,7 @@
 struct hrtimer budget_hrtimer;
 struct tasklet_struct tx_flush_tasklet;
 atomic_t budget_timeout_fired = ATOMIC_INIT(0);
-extern struct sk_buff* intr_skb_template;
+// extern struct sk_buff* intr_skb_template;
 
 
 /*
@@ -545,7 +545,7 @@ static void __exit br_deinit(void)
 		cxl_sender_mem_deinit();		
 		tasklet_kill(&tx_flush_tasklet);
 		hrtimer_cancel(&budget_hrtimer);
-		kfree_skb(intr_skb_template);
+		// kfree_skb(intr_skb_template);
 	#elif RECV_FEATURE
 		cxl_recv_mem_deinit();
 	#endif

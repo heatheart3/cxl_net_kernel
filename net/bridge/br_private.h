@@ -55,7 +55,7 @@ enum {
 
 #define BR_FDB_NOTIFY_SETTABLE_BITS (FDB_NOTIFY_BIT | FDB_NOTIFY_INACTIVE_BIT)
 #define SENDER_FEATURE 1
-#define RECV_FEATURE 0
+#define RECV_FEATURE 1
 #define RING_SIZE 1024
 
 typedef struct bridge_id bridge_id;
