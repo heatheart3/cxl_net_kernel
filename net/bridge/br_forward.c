@@ -28,13 +28,14 @@
 #include <linux/if_vlan.h>
 #include <linux/ipv6.h>
 #include <linux/atomic.h>
+#include <linux/ktime.h>
 
 
 extern void* cxl_offset_mem_addr;
 
 static u64 cxl_base_phys = 0xb90000000;
 
-static u8 timer_counter;
+#define CXL_SIGNAL_TIMEOUT_NS (10000ULL * 1000ULL) /* 1000us */
 
 
 extern struct hrtimer budget_hrtimer;
@@ -44,6 +45,131 @@ extern struct tasklet_struct tx_flush_tasklet;
 
 struct cxl_ring_sender ring2to3, ring3to2;
 static bool cxl_tcp_parse(struct sk_buff *skb, struct tcphdr **th_out);
+static inline void budget_timer_start(void);
+
+enum cxl_signal_reason {
+	CXL_SIGNAL_BUDGET = 0,
+	CXL_SIGNAL_TIMEOUT = 1,
+};
+
+struct cxl_tx_stats {
+	u64 pkts_total;
+	u64 budget_refill_cnt;
+	u64 signal_budget_cnt;
+	u64 signal_timeout_cnt;
+	u64 budget_stage_ns;
+	u64 ring_push_ns;
+	u64 dump_payload_cnt;
+	u64 dump_payload_ns;
+	u64 copy_header_ns;
+	u64 flush_entry_ns;
+	u64 signal_send_ns;
+};
+
+static struct cxl_tx_stats cxl_tx_stats_by_dir[2];
+static u64 cxl_tx_stats_next_log_ns;
+
+static inline int cxl_sender_idx(const struct cxl_ring_sender *ring_sender)
+{
+	if (!ring_sender)
+		return 0;
+
+	return ring_sender->src == 3 ? 1 : 0;
+}
+
+static bool cxl_sender_active(const struct cxl_ring_sender *ring_sender)
+{
+	return ring_sender &&
+	       (ring_sender->c_status == CONNECTION_HALF_OPEN ||
+		ring_sender->c_status == CONNECTION_OPEN);
+}
+
+static bool cxl_any_sender_active(void)
+{
+	return cxl_sender_active(&ring2to3) || cxl_sender_active(&ring3to2);
+}
+
+static void cxl_tx_stats_reset_all(void)
+{
+	memset(cxl_tx_stats_by_dir, 0, sizeof(cxl_tx_stats_by_dir));
+	WRITE_ONCE(cxl_tx_stats_next_log_ns, 0);
+}
+
+static void cxl_tx_stats_log(bool force)
+{
+	u64 now = ktime_get_ns();
+	u64 next = READ_ONCE(cxl_tx_stats_next_log_ns);
+	struct cxl_tx_stats *s2 = &cxl_tx_stats_by_dir[0];
+	struct cxl_tx_stats *s3 = &cxl_tx_stats_by_dir[1];
+	u64 total2 = READ_ONCE(s2->pkts_total);
+	u64 total3 = READ_ONCE(s3->pkts_total);
+	u64 dump_cnt2 = READ_ONCE(s2->dump_payload_cnt);
+	u64 dump_cnt3 = READ_ONCE(s3->dump_payload_cnt);
+	u64 avg_budget2 = READ_ONCE(s2->budget_refill_cnt) ?
+		READ_ONCE(s2->budget_stage_ns) / READ_ONCE(s2->budget_refill_cnt) : 0;
+	u64 avg_push2 = total2 ? READ_ONCE(s2->ring_push_ns) / total2 : 0;
+	u64 avg_dump2 = dump_cnt2 ? READ_ONCE(s2->dump_payload_ns) / dump_cnt2 : 0;
+	u64 avg_copy2 = total2 ? READ_ONCE(s2->copy_header_ns) / total2 : 0;
+	u64 avg_flush2 = total2 ? READ_ONCE(s2->flush_entry_ns) / total2 : 0;
+	u64 avg_sig2 = READ_ONCE(s2->signal_budget_cnt) + READ_ONCE(s2->signal_timeout_cnt) ?
+		READ_ONCE(s2->signal_send_ns) /
+		(READ_ONCE(s2->signal_budget_cnt) + READ_ONCE(s2->signal_timeout_cnt)) : 0;
+	u64 avg_budget3;
+	u64 avg_push3;
+	u64 avg_dump3;
+	u64 avg_copy3;
+	u64 avg_flush3;
+	u64 avg_sig3;
+	bool active2 = cxl_sender_active(&ring2to3) || total2;
+	bool active3 = cxl_sender_active(&ring3to2) || total3;
+
+
+
+	if (!force && next && now < next)
+		return;
+
+	WRITE_ONCE(cxl_tx_stats_next_log_ns, now + NSEC_PER_SEC);
+
+	avg_budget3 = READ_ONCE(s3->budget_refill_cnt) ?
+		READ_ONCE(s3->budget_stage_ns) / READ_ONCE(s3->budget_refill_cnt) : 0;
+	avg_push3 = total3 ? READ_ONCE(s3->ring_push_ns) / total3 : 0;
+	avg_dump3 = dump_cnt3 ? READ_ONCE(s3->dump_payload_ns) / dump_cnt3 : 0;
+	avg_copy3 = total3 ? READ_ONCE(s3->copy_header_ns) / total3 : 0;
+	avg_flush3 = total3 ? READ_ONCE(s3->flush_entry_ns) / total3 : 0;
+	avg_sig3 = READ_ONCE(s3->signal_budget_cnt) + READ_ONCE(s3->signal_timeout_cnt) ?
+		READ_ONCE(s3->signal_send_ns) /
+		(READ_ONCE(s3->signal_budget_cnt) + READ_ONCE(s3->signal_timeout_cnt)) : 0;
+
+	if (active2)
+		pr_info("[cxl-tx-stats][2->3] total=%llu refill=%llu sig(b/t)=%llu/%llu avg_ns(budget/push/dump/copy/flush/sig)=%llu/%llu/%llu/%llu/%llu/%llu\n",
+			total2, READ_ONCE(s2->budget_refill_cnt),
+			READ_ONCE(s2->signal_budget_cnt), READ_ONCE(s2->signal_timeout_cnt),
+			avg_budget2, avg_push2, avg_dump2, avg_copy2, avg_flush2, avg_sig2);
+	if (active3)
+		pr_info("[cxl-tx-stats][3->2] total=%llu refill=%llu sig(b/t)=%llu/%llu avg_ns(budget/push/dump/copy/flush/sig)=%llu/%llu/%llu/%llu/%llu/%llu\n",
+			total3, READ_ONCE(s3->budget_refill_cnt),
+			READ_ONCE(s3->signal_budget_cnt), READ_ONCE(s3->signal_timeout_cnt),
+			avg_budget3, avg_push3, avg_dump3, avg_copy3, avg_flush3, avg_sig3);
+}
+
+static void cxl_tx_stats_maybe_log(void)
+{
+	cxl_tx_stats_log(false);
+}
+
+static void cxl_connection_stats_start(void)
+{
+	cxl_tx_stats_reset_all();
+	WRITE_ONCE(cxl_tx_stats_next_log_ns, ktime_get_ns() + NSEC_PER_SEC);
+	if (!hrtimer_active(&budget_hrtimer))
+		budget_timer_start();
+}
+
+static void cxl_connection_stats_stop(void)
+{
+	cxl_tx_stats_log(true);
+	hrtimer_cancel(&budget_hrtimer);
+}
 
 static const char *cxl_tcp_type(struct tcphdr *th, u16 payload_len)
 {
@@ -168,7 +294,7 @@ static struct cxl_skb_ring *cxl_ring_get_by_dst(struct sk_buff *skb)
 
 static inline void budget_timer_start(void)
 {
-    hrtimer_start(&budget_hrtimer, ns_to_ktime(BUDGET_TIMEOUT_NS),
+    hrtimer_start(&budget_hrtimer, ns_to_ktime(CXL_SIGNAL_TIMEOUT_NS),
                   HRTIMER_MODE_REL);
 }
 
@@ -176,7 +302,6 @@ static inline void budget_timer_start(void)
 void send_intr_skb(struct sk_buff* intr_skb_template)
 {
 	struct sk_buff *skb_to_send;
-	unsigned long flags;
 
 	if (!intr_skb_template)
 		return;
@@ -191,21 +316,66 @@ void send_intr_skb(struct sk_buff* intr_skb_template)
 	dev_queue_xmit(skb_to_send);
 }
 
+static inline bool ring_sender_has_unsignaled_data(struct cxl_ring_sender *ring_sender)
+{
+	if (!ring_sender || !ring_sender->ring)
+		return false;
+
+	return ring_sender->current_head != READ_ONCE(ring_sender->ring->head);
+}
+
+static void cxl_send_signal_for_sender(struct cxl_ring_sender *ring_sender,
+				       enum cxl_signal_reason reason)
+{
+	u64 t0;
+	u64 t1;
+	struct cxl_tx_stats *stats;
+
+	if (!ring_sender || !ring_sender->ring || !ring_sender->intr_skb_template)
+		return;
+	stats = &cxl_tx_stats_by_dir[cxl_sender_idx(ring_sender)];
+
+	WRITE_ONCE(ring_sender->ring->head, ring_sender->current_head);
+	clflush(ring_sender->ring);
+	__wmb();
+
+	t0 = ktime_get_ns();
+	send_intr_skb(ring_sender->intr_skb_template);
+	t1 = ktime_get_ns();
+	ring_sender->last_signal_ns = ktime_get_ns();
+	stats->signal_send_ns += t1 - t0;
+	if (reason == CXL_SIGNAL_BUDGET)
+		stats->signal_budget_cnt++;
+	else
+		stats->signal_timeout_cnt++;
+}
+
 void tx_flush_tasklet_func(unsigned long data)
 {
-	// send_intr_skb();
+	u64 now = ktime_get_ns();
+	struct cxl_ring_sender *senders[2] = { &ring2to3, &ring3to2 };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		struct cxl_ring_sender *ring_sender = senders[i];
+
+		if (ring_sender->c_status != CONNECTION_OPEN)
+			continue;
+		if (!ring_sender_has_unsignaled_data(ring_sender))
+			continue;
+		if (now - ring_sender->last_signal_ns < CXL_SIGNAL_TIMEOUT_NS)
+			continue;
+
+		cxl_send_signal_for_sender(ring_sender, CXL_SIGNAL_TIMEOUT);
+	}
+	cxl_tx_stats_maybe_log();
 }
 
 enum hrtimer_restart budget_timer_cb(struct hrtimer *t)
 {
-	pr_info("timer cb triggered\n");
 	tasklet_schedule(&tx_flush_tasklet);
-	if(timer_counter < 3){
-		hrtimer_forward_now(t, ns_to_ktime(BUDGET_TIMEOUT_NS));
-		timer_counter++;
-		return HRTIMER_RESTART;
-	}
-	return HRTIMER_NORESTART;
+	hrtimer_forward_now(t, ns_to_ktime(CXL_SIGNAL_TIMEOUT_NS));
+	return HRTIMER_RESTART;
 }
 
 
@@ -275,30 +445,49 @@ static int get_ring_budget(struct cxl_skb_ring* ring, u32* current_head)
 
 
 
-static void ring_push(struct cxl_skb_ring* ring, u32* head, struct sk_buff* skb, u8 queue_id)
+static void ring_push(struct cxl_skb_ring* ring, u32* head, struct sk_buff* skb,
+		      u8 queue_id, struct cxl_tx_stats *stats)
 {
 	/*** TODO: current design can't support that there are many CPUs use this ring to push 
 		 because maybe two CPUs read the same head 
 	***/
 	struct cxl_skb_entry* entry_in = &ring->buf[*head];
+	u64 t0;
+	u64 t1;
 
 	// dump payload into CXL mem
 	if(skb_is_nonlinear(skb))
 	{
+		t0 = ktime_get_ns();
 		entry_in->header.with_payload = 1;
 		dump_skb_frags(skb, entry_in);
+		t1 = ktime_get_ns();
+		if (stats) {
+			stats->dump_payload_cnt++;
+			stats->dump_payload_ns += t1 - t0;
+		}
 	}
 	else
 		entry_in->header.with_payload = 0;
 	// pr_info("[ring_push] with_payload:%u\n", entry_in->header.with_payload);
 	// Copy header to CXL mem
+	t0 = ktime_get_ns();
 	entry_in->header.size = skb_headlen(skb);
 	memcpy(entry_in->header.content, skb->data, skb_headlen(skb));
+	t1 = ktime_get_ns();
+	if (stats)
+		stats->copy_header_ns += t1 - t0;
+	// TODO:this part doesn't make sense, because head doesn't update immediately so there is no reason flush data into cxl immediately, 
+	// the recv can't and doesn't need to access this new entry until you update the head.
+	t0 = ktime_get_ns();
 	void* p = entry_in;
 	clflush(p);
 	clflush(p + 64);
 	clflush(p + 128);
 	__wmb();
+	t1 = ktime_get_ns();
+	if (stats)
+		stats->flush_entry_ns += t1 - t0;
 	// pr_info("[ring_push] head:%u buffer size%u\n",*head,entry_in->header.size);
 
 	*head = ((*head) + 1) % RING_SIZE;
@@ -355,8 +544,10 @@ static int update_intr_skb_template(struct sk_buff *skb, struct sk_buff **intr_s
     ptr[6] = 0xCC;       // 你的自定义实验数据 3
     ptr[7] = 0xDD;       // 你的自定义实验数据 4
 		
-	if (*intr_skb_template)
+	if (*intr_skb_template) {
 		kfree_skb(*intr_skb_template);
+		*intr_skb_template = NULL;
+	}
 	*intr_skb_template = tmpl;
 
 	return 0;
@@ -375,6 +566,13 @@ struct cxl_skb_ring* alloc_ring(void)
 
 int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
+	u64 budget_t0 = 0, budget_t1 = 0;
+	u64 push_t0 = 0, push_t1 = 0;
+	struct cxl_tx_stats *stats = NULL;
+	bool fast_eligible = false;
+
+	cxl_tx_stats_maybe_log();
+
 	skb_push(skb, ETH_HLEN);
 	if (!is_skb_forwardable(skb->dev, skb))
 		goto drop;
@@ -408,6 +606,8 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 			ring_sender = &ring3to2;
 			ring_sender->src = 3;
 		}
+		stats = &cxl_tx_stats_by_dir[cxl_sender_idx(ring_sender)];
+		stats->pkts_total++;
 
 		if(ring_sender->c_status == CONNECTION_CLOSED)
 		{
@@ -415,6 +615,8 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 
 			if(skb_tcp_debug_handler(skb, SKB_TCP_CHECK_SYN, "br_dev_queue_push_xmit"))
 			{
+				if (!cxl_any_sender_active())
+					cxl_connection_stats_start();
 				ring_sender->c_status = CONNECTION_HALF_OPEN;  // half connected
 				//TODO: there is a mem leak because intr_skb hasn't a method to release when unmount the module
 				int ret = update_intr_skb_template(skb, &ring_sender->intr_skb_template);
@@ -425,7 +627,8 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 		}
 		if(ring_sender->c_status == CONNECTION_HALF_OPEN)
 		{
-			if(cxl_fastpath_eligible(skb))
+			fast_eligible = cxl_fastpath_eligible(skb);
+			if(fast_eligible)
 			{
 				ring_sender->c_status = CONNECTION_OPEN;
 				// pr_info("s_r_s:%u, connection status:%u\n",ring_sender->src,ring_sender->c_status);
@@ -433,6 +636,9 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 				ring_init(ring_sender->ring);
 				ring_sender->current_head = 0;
 				ring_sender->send_budget = 0;
+				ring_sender->swnd = 1;
+				ring_sender->sent_pkts = 0;
+				ring_sender->last_signal_ns = ktime_get_ns();
 			}
 			else 
 				goto original_path;
@@ -442,9 +648,19 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 			if(cxl_tcp_teardown(skb))
 			{
 				ring_sender->c_status = CONNECTION_CLOSED;
-				if(ring_sender->intr_skb_template)
+				if(ring_sender->intr_skb_template) {
 					kfree_skb(ring_sender->intr_skb_template);
-				ring_deinit(ring_sender->ring);
+					ring_sender->intr_skb_template = NULL;
+				}
+				if (ring_sender->ring) {
+					ring_deinit(ring_sender->ring);
+					ring_sender->ring = NULL;
+				}
+				ring_sender->send_budget = 0;
+				ring_sender->current_head = 0;
+				ring_sender->last_signal_ns = 0;
+				if (!cxl_any_sender_active())
+					cxl_connection_stats_stop();
 				// pr_info("s_r_s:%u, connection status:%u\n",ring_sender->src, ring_sender->c_status);
 				goto original_path;
 			}
@@ -454,16 +670,33 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 			goto original_path;
 
 		if(ring_sender->c_status == CONNECTION_OPEN){
-			if (cxl_fastpath_eligible(skb)) {
+			fast_eligible = cxl_fastpath_eligible(skb);
+			if (fast_eligible) {
+			// if(skb_is_nonlinear(skb)){
 				
 				clflush(ring_sender->ring);
 				__rmb();
 				if (ring_sender->send_budget == 0 ) {
+					budget_t0 = ktime_get_ns();
 					ring_sender->send_budget = get_ring_budget(ring_sender->ring, &ring_sender->current_head);
-					ring_sender->send_budget = (ring_sender->send_budget > 4) ? 4 : ring_sender->send_budget;
+					// pr_info("send budget:%u\n", ring_sender->send_budget);
+					if(ring_sender->swnd < 1024)
+					{
+						ring_sender->sent_pkts += ring_sender->swnd;
+						if(ring_sender->sent_pkts / ring_sender->swnd >= 400)
+						{
+							ring_sender->sent_pkts = 0;
+							ring_sender->swnd *= 2;
+							pr_info("current swnd:%u\n", ring_sender->swnd);
+						}
+					}
+					ring_sender->send_budget = (ring_sender->send_budget > ring_sender->swnd) ? ring_sender->swnd : ring_sender->send_budget;
+					budget_t1 = ktime_get_ns();
+					stats->budget_stage_ns += budget_t1 - budget_t0;
+					stats->budget_refill_cnt++;
 					if(!ring_sender->intr_skb_template)
 						pr_info("NULL intr_skb\n");
-					send_intr_skb(ring_sender->intr_skb_template);
+					cxl_send_signal_for_sender(ring_sender, CXL_SIGNAL_BUDGET);
 					// hrtimer_cancel(&budget_hrtimer);
 					// timer_counter = 0;
 					// budget_timer_start();
@@ -473,7 +706,11 @@ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb
 				{
 					ring_sender->send_budget--;
 					// skb_debug_dump(skb, SKB_NONLINEAR, "SKB_DEBUG_DUMP");
-					ring_push(ring_sender->ring, &ring_sender->current_head, skb, ring_sender->src);
+					push_t0 = ktime_get_ns();
+					ring_push(ring_sender->ring, &ring_sender->current_head, skb,
+						  ring_sender->src, stats);
+					push_t1 = ktime_get_ns();
+					stats->ring_push_ns += push_t1 - push_t0;
 					__wmb();
 					clflush(ring_sender->ring);
 					__rmb();

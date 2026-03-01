@@ -649,9 +649,10 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 	 * Both skb->head and skb_shared_info are cache line aligned.
 	 */
 	// change to page backed head
-	if(node_online(1))
-		data = kmalloc_reserve(&size, gfp_mask, 1, &pfmemalloc);
-	else
+	/** Header on CXL **/
+	// if(node_online(1))
+	// 	data = kmalloc_reserve(&size, gfp_mask, 1, &pfmemalloc);
+	// else
 		data = kmalloc_reserve(&size, gfp_mask, node, &pfmemalloc);
 	// struct page* p = alloc_page(GFP_KERNEL);
 	// if (unlikely(!p))
@@ -693,20 +694,20 @@ nodata:
 }
 EXPORT_SYMBOL(__alloc_skb);
 
-struct sk_buff* cxl_skb_fclone_alloc(unsigned int size,
-					       gfp_t priority)
-{
-	if(node_online(1))
-	{
-		return __alloc_skb(size, priority, SKB_ALLOC_FCLONE, 1);
-	}
-	else
-	{
-		return __alloc_skb(size, priority, SKB_ALLOC_FCLONE, NUMA_NO_NODE);
-	}
+// struct sk_buff* cxl_skb_fclone_alloc(unsigned int size,
+// 					       gfp_t priority)
+// {
+// 	if(node_online(1))
+// 	{
+// 		return __alloc_skb(size, priority, SKB_ALLOC_FCLONE, 1);
+// 	}
+// 	else
+// 	{
+// 		return __alloc_skb(size, priority, SKB_ALLOC_FCLONE, NUMA_NO_NODE);
+// 	}
 
-}
-EXPORT_SYMBOL(cxl_skb_fclone_alloc);
+// }
+// EXPORT_SYMBOL(cxl_skb_fclone_alloc);
 /**
  *	__netdev_alloc_skb - allocate an skbuff for rx on a specific device
  *	@dev: network device to receive on

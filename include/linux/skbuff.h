@@ -1333,8 +1333,8 @@ static inline bool skb_fclone_busy(const struct sock *sk,
 	       READ_ONCE(fclones->skb2.sk) == sk;
 }
 
-struct sk_buff* cxl_skb_fclone_alloc(unsigned int size,
-					       gfp_t priority);
+// struct sk_buff* cxl_skb_fclone_alloc(unsigned int size,
+// 					       gfp_t priority);
 
 /**
  * alloc_skb_fclone - allocate a network buffer from fclone cache

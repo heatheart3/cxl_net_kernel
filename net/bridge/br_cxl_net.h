@@ -15,6 +15,9 @@ struct cxl_ring_sender{
     u32 current_head;
     struct cxl_skb_ring* ring;
     struct sk_buff* intr_skb_template;
+    u32 swnd;
+    u32 sent_pkts;
+    u64 last_signal_ns;
 };
 
 struct cxl_ring_recver{
@@ -24,5 +27,4 @@ struct cxl_ring_recver{
     u32 current_tail;
     struct cxl_skb_ring* ring;
 };
-
 

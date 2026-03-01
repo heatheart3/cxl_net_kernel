@@ -156,7 +156,7 @@ void replace_skb_with_cxl_page(struct sk_buff *skb, int cxl_pfn,
     // set_page_count(cxl_page, 1024);
 	// if (!get_page_unless_zero(cxl_page))
 	// 	return;
-	if( page_count(cxl_page) <= 10)
+	// if( page_count(cxl_page) <= 10)
 		get_page(cxl_page);
 	// pr_info("[replace_skb_page]: CXL Page PFN: 0x%lx, RefCount After: %d\n", 
     //     page_to_pfn(cxl_page), page_count(cxl_page));
